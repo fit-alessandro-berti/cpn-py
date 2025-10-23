@@ -15,7 +15,7 @@
 
 You can install `cpnpy` from Pypi using the command:
 ```bash
-pip install -U cnpy
+pip install -U cpnpy
 ```
 
 You can install `cpnpy` directly from source:
