@@ -1,45 +1,79 @@
 import copy
-from collections import Counter
-from typing import Optional, Union
+import types
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
+from types import ModuleType
 from cpnpy.cpn.colorsets import *
+import re
+import itertools
+from collections import defaultdict
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable
+
+
+class InputView:
+    def __init__(self, data: dict):
+        self._data = data
+
+    def __getattr__(self, name: str):
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(name)
+
+    def get(self, name: str, default=None):
+        return self._data.get(name, default)
+
+    def as_dict(self) -> dict:
+        return dict(self._data)  # defensive copy
+
+
+class OutputScope:
+    def __init__(self):
+        self._data = {}
+
+    def __getattr__(self, name: str):
+        if name in self._data:
+            return self._data[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name: str, value):
+        if name == "_data":
+            super().__setattr__(name, value)
+        else:
+            self._data[name] = value
+
+    def as_dict(self) -> dict:
+        return dict(self._data)
+
+
+TransitionAction = Callable[[InputView, OutputScope], None]
 
 
 # -----------------------------------------------------------------------------------
 # Token with Time
 # -----------------------------------------------------------------------------------
+@dataclass(frozen=True)
 class Token:
-    def __init__(self, value: Any, timestamp: int = 0):
-        self.value = value
-        self.timestamp = timestamp  # For timed tokens
+    value: Any
+    timestamp: int = 0 # For timed tokens
 
     def __repr__(self):
         if self.timestamp != 0:
-            return f"Token({self.value}, t={self.timestamp})"
+            return f"Token({self.value}, timestamp={self.timestamp})"
         return f"Token({self.value})"
+
 
     def __copy__(self):
         # Shallow copy: values assumed to be immutable or just referenced
-        cls = self.__class__
-        result = cls.__new__(cls)
-        result.value = self.value
-        result.timestamp = self.timestamp
-        return result
+        return self  # immutable
 
     def __deepcopy__(self, memo):
-        cls = self.__class__
-        result = cls.__new__(cls)
-        memo[id(self)] = result
         # Deepcopy value (in case it's a complex object)
-        result.value = copy.deepcopy(self.value, memo)
-        result.timestamp = self.timestamp
-        return result
+        return Token(copy.deepcopy(self.value, memo), self.timestamp)
 
 
+@dataclass
 class Multiset:
-    def __init__(self, tokens: Optional[List[Token]] = None):
-        if tokens is None:
-            tokens = []
-        self.tokens = tokens
+    tokens: List[Token] = field(default_factory=list)
 
     def add(self, token_value: Any, timestamp: int = 0, count: int = 1):
         for _ in range(count):
@@ -153,10 +187,13 @@ class Marking:
 # EvaluationContext
 # -----------------------------------------------------------------------------------
 class EvaluationContext:
-    def __init__(self, user_code: Optional[str] = None):
+    def __init__(self, user_code: Optional[Union[str, ModuleType]] = None):
         self.env = {}
         if user_code is not None:
-            exec(user_code, self.env)
+            if isinstance(user_code, str):
+                exec(user_code, self.env)
+            elif isinstance(user_code, ModuleType):
+                self.env.update(user_code.__dict__)
 
     def evaluate_guard(self, guard_expr: Optional[str], binding: Dict[str, Any]) -> bool:
         if guard_expr is None:
@@ -177,6 +214,27 @@ class EvaluationContext:
         if isinstance(val, list):
             return val, delay
         return [val], delay
+
+    def evaluate_action(
+        self,
+        action: TransitionAction,
+        binding: Dict[str, Any]
+    ):
+        inp = InputView(binding)
+        out = OutputScope()
+
+        # --- rebind function so its globals == self.env ---
+        action_with_env = types.FunctionType(
+            action.__code__,
+            self.env,
+            name=action.__name__,
+            argdefs=action.__defaults__,
+            closure=action.__closure__,
+        )
+
+        action_with_env(inp, out)
+
+        return out
 
     def __copy__(self):
         cls = self.__class__
@@ -223,18 +281,32 @@ class Place:
         return result
 
 
+
+# -------------------------
+# Transition
+# -------------------------
 class Transition:
-    def __init__(self, name: str, guard: Optional[str] = None, variables: Optional[List[str]] = None,
-                 transition_delay: int = 0):
+    def __init__(
+        self,
+        name: str,
+        guard: Optional[str] = None,
+        variables: Optional[List[str]] = None,
+        action: Optional[TransitionAction] = None,
+        transition_delay: int = 0,
+        priority: int = 0,  # lower value => higher priority
+    ):
         self.name = name
         self.guard_expr = guard
         self.variables = variables if variables else []
+        self.action = action
         self.transition_delay = transition_delay
+        self.priority = int(priority)
 
     def __repr__(self):
-        guard_str = self.guard_expr if self.guard_expr is not None else "None"
-        vars_str = ", ".join(self.variables) if self.variables else "None"
-        return f"Transition(name='{self.name}', guard='{guard_str}', variables=[{vars_str}], delay={self.transition_delay})"
+        guard_str = repr(self.guard_expr) if self.guard_expr is not None else "None"
+        vars_str = f'[' + ", ".join(map(lambda v: "'" + v + "'", self.variables)) + ']' if self.variables else "None"
+        action_str = repr(self.action) if self.action is not None else "None"
+        return f"Transition(name='{self.name}', guard={guard_str}, variables={vars_str}, action={action_str}, transition_delay={self.transition_delay}, priority={self.priority})"
 
     def __copy__(self):
         cls = self.__class__
@@ -242,7 +314,9 @@ class Transition:
         result.name = self.name
         result.guard_expr = self.guard_expr
         result.variables = self.variables[:]
+        result.action = self.action
         result.transition_delay = self.transition_delay
+        result.priority = self.priority
         return result
 
     def __deepcopy__(self, memo):
@@ -252,7 +326,9 @@ class Transition:
         result.name = copy.deepcopy(self.name, memo)
         result.guard_expr = copy.deepcopy(self.guard_expr, memo)
         result.variables = copy.deepcopy(self.variables, memo)
+        result.action = copy.deepcopy(self.action, memo)
         result.transition_delay = self.transition_delay
+        result.priority = copy.deepcopy(self.priority, memo)
         return result
 
 
@@ -265,7 +341,7 @@ class Arc:
     def __repr__(self):
         src_name = self.source.name if isinstance(self.source, Place) else self.source.name
         tgt_name = self.target.name if isinstance(self.target, Place) else self.target.name
-        return f"Arc(source='{src_name}', target='{tgt_name}', expr='{self.expression}')"
+        return f"Arc(source='{src_name}', target='{tgt_name}', expression='{self.expression}')"
 
     def __copy__(self):
         cls = self.__class__
@@ -340,11 +416,25 @@ class CPN:
             values, _ = context.evaluate_arc(arc.expression, binding)
             marking.remove_tokens(arc.source.name, values)
 
+        # Execute action if any
+        out = None
+        if t.action is not None:
+            out = context.evaluate_action(t.action, binding)
+
         # Add tokens with proper timestamps
+        locals_after_action = {}
+        locals_after_action.update(binding)
+        if out is not None:
+            locals_after_action.update(out.as_dict())
         for arc in self.get_output_arcs(t):
-            values, arc_delay = context.evaluate_arc(arc.expression, binding)
+            values, arc_delay = context.evaluate_arc(arc.expression, locals_after_action)
             for v in values:
                 place = arc.target
+
+                # validate token value against place colorset
+                if not place.colorset.is_member(v):
+                    raise Exception(f"Token value {v} is not a member of colorset {place.colorset} for place {place.name}")
+
                 new_timestamp = marking.global_clock + t.transition_delay + arc_delay
                 if place.colorset.timed:
                     marking.add_tokens(place.name, [v], timestamp=new_timestamp)

@@ -12,7 +12,7 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
     Input and output tokens for each event are considered as related objects.
     The object type is derived from the place's color set.
     """
-    marking = copy.deepcopy(initial_marking)
+    marking = initial_marking
 
     # Data structures to build the OCEL
     event_list = []
@@ -50,10 +50,13 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
                 # After advancing clock, check again
                 continue
 
-        # Fire an arbitrary enabled transition
-        t = enabled_transitions[0]
+        # Lower value => higher priority. Only choose among best-priority transitions.
+        best_pri = min(getattr(t, "priority", 0) for t in enabled_transitions)
+        best = [t for t in enabled_transitions if getattr(t, "priority", 0) == best_pri]
 
-        # Determine the actual binding used to fire
+        # choose one (random among ties to avoid bias)
+        t = random.choice(best)
+
         binding = cpn._find_binding(t, marking, context)
         if binding is None:
             # If no binding found, skip (should be rare)
@@ -82,7 +85,7 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
 
         # For output arcs
         for arc in cpn.get_output_arcs(t):
-            values, arc_delay = context.evaluate_arc(arc.expression, binding)
+            values, _ = context.evaluate_arc(arc.expression, binding)
             otype = get_object_type_from_colorset(arc.target)  # derive from target place's color set
             for v in values:
                 obj_id = make_object_id(v)

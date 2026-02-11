@@ -151,6 +151,29 @@ class DictionaryColorSet(ColorSet):
         name_str = f"{self.name + ' ' if self.name else ''}"
         return f"{name_str}DictionaryColorSet{timed_str}"
 
+class RecordColorSet(ColorSet):
+    """
+    A color set for records, where each field has a name and an associated color set.
+    """
+
+    def __init__(self, field_types: List[tuple], timed: bool = False, name: str = None):
+        super().__init__(timed=timed, name=name)
+        self.field_types = field_types  # List of (field_name, ColorSet)
+
+    def is_member(self, value: Any) -> bool:
+        if not isinstance(value, dict):
+            return False
+        for field_name, cs in self.field_types:
+            if field_name not in value or not cs.is_member(value[field_name]):
+                return False
+        return True
+
+    def __repr__(self):
+        timed_str = " timed" if self.timed else ""
+        name_str = f"{self.name + ' ' if self.name else ''}"
+        fields_str = ", ".join(f"{name}: {repr(cs)}" for name, cs in self.field_types)
+        return f"{name_str}RecordColorSet({{{fields_str}}}){timed_str}"
+
 
 class ListColorSet(ColorSet):
     """
@@ -217,21 +240,21 @@ class ColorSetParser:
             return self._parse_enumerated_type(type_str, timed)
 
         # Direct primitive types
-        if type_str == "int":
+        if type_str.lower() == "int":
             return IntegerColorSet(timed=timed)
-        if type_str == "real":
+        if type_str.lower() == "real":
             return RealColorSet(timed=timed)
-        if type_str == "string":
+        if type_str.lower() == "string":
             return StringColorSet(timed=timed)
-        if type_str == "dict":
+        if type_str.lower() == "dict":
             return DictionaryColorSet(timed=timed)
-        if type_str == "bool":
+        if type_str.lower() == "bool":
             return BoolColorSet(timed=timed)
-        if type_str == "unit":
+        if type_str.lower() == "unit":
             return UnitColorSet(timed=timed)
-        if type_str == "intinf":
+        if type_str.lower() == "intinf":
             return IntInfColorSet(timed=timed)
-        if type_str == "time":
+        if type_str.lower() == "time":
             return TimeColorSet(timed=timed)
 
         # "list" type: "list int", "list bool", "list MyEnumeratedSet", etc.
@@ -252,6 +275,37 @@ class ColorSetParser:
             cs1 = self._parse_type(type1_str, False)
             cs2 = self._parse_type(type2_str, False)
             return ProductColorSet(cs1, cs2, timed=timed)
+
+        # product without parentheses which is translated to RecordColorSet with fields _1, _2, ... : product int * string -> record _1:int * _2:string
+        if type_str.startswith("product "):
+            inner = type_str[len("product "):].strip()
+            parts = inner.split("*")
+            field_types = []
+            for i, part in enumerate(parts):
+                part = part.strip()
+                field_name = f"_${i+1}"
+                field_cs = self._parse_type(part, False)
+                field_types.append((field_name, field_cs))
+            return RecordColorSet(field_types, timed=timed)
+
+
+        if type_str.startswith("record"):
+            # parse things like record id:STRING * leave_at: TIME * ... [timed]
+            fields_str = type_str[len("record"):].strip()
+            fields_and_types = fields_str.split("*")
+            field_types = []
+            for field_def in fields_and_types:
+                field_def = field_def.strip()
+                if ":" not in field_def:
+                    raise ValueError(f"Invalid record field definition: {field_def}")
+                field_name, field_type_str = field_def.split(":", 1)
+                field_name = field_name.strip()
+                field_type_str = field_type_str.strip()
+                field_cs = self._parse_type(field_type_str, False)
+                field_types.append((field_name, field_cs))
+
+            return RecordColorSet(field_types, timed=timed)
+
 
         # If it's referencing a previously-defined colorset
         if type_str in self.colorsets:
@@ -310,6 +364,7 @@ if __name__ == "__main__":
     colset MyTime = time;
     colset MyListOfInts = list int;
     colset MyProduct = product(Colors, MyInts) timed;
+    colset MyRecord = record id:MyInts * items: MyListOfInts timed;
     """
 
     parsed = parser.parse_definitions(definitions)
@@ -342,3 +397,6 @@ if __name__ == "__main__":
     # Product test
     print("MyProduct.is_member(('red', 10)):", parsed['MyProduct'].is_member(('red', 10)))
     print("MyProduct.is_member(('red', 'notint')):", parsed['MyProduct'].is_member(('red', 'notint')))
+
+    # Record test
+    print("MyRecord.is_member({'id': 1, 'items': [1,2,3]}):", parsed['MyRecord'].is_member({'id': 1, 'items': [1,2,3]}))
