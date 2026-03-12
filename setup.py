@@ -23,7 +23,7 @@ def load_requirements(filename):
         ]
 
 
-install_requires = ["pm4py", "jsonschema", "simpy"]
+install_requires = ["pm4py", "jsonschema", "simpy", "pyvis", "pydot"]
 
 setup(
     name=meta["__title__"],

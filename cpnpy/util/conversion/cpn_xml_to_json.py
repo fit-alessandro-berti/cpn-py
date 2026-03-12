@@ -2,6 +2,101 @@ import xml.etree.ElementTree as ET
 import re
 from typing import Dict, Any, List, Optional, Union
 
+
+def parse_color_element(color_elem: ET.Element) -> str:
+    """
+    Convert a <color> element into a 'colset <Name> = <Type>;' string.
+    If <layout> is present, we use that text directly (like "colset MYCOL = int;").
+    Otherwise, we inspect child tags to guess the color definition.
+    """
+    # 1) Extract color name from <id> child
+    name_elt = color_elem.find("id")
+    if name_elt is not None and name_elt.text:
+        color_name = name_elt.text.strip()
+    else:
+        color_name = "UnknownColor"
+
+    # 2) If there's a <layout> child, use that text directly.
+    #    Typically <layout> is something like: "colset UNIT_TIMED = UNIT timed;"
+    layout_elt = color_elem.find("layout")
+    if layout_elt is not None and layout_elt.text:
+        # Just return that line as is (trim any whitespace).
+        layout_text = layout_elt.text.strip()
+        return layout_text
+
+    # 3) Otherwise, build from known child tags:
+    color_type = ""
+    timed_flag = False
+    alias_target = None
+    list_target = None
+
+    for child in color_elem:
+        tag_lower = child.tag.lower()
+        if tag_lower == "int":
+            color_type = "int"
+        elif tag_lower == "real":
+            color_type = "real"
+        elif tag_lower == "string":
+            color_type = "string"
+        elif tag_lower == "bool":
+            color_type = "bool"
+        elif tag_lower == "unit":
+            color_type = "unit"
+        elif tag_lower == "intinf":
+            color_type = "intinf"
+        elif tag_lower == "time":
+            color_type = "time"
+        elif tag_lower == "timed":
+            timed_flag = True
+        elif tag_lower == "enum":
+            # gather enumerated items from <id> sub-elements
+            item_texts = []
+            for idchild in child.findall("id"):
+                val = idchild.text.strip()
+                item_texts.append(val)
+            joined = ", ".join(f"'{x}'" for x in item_texts)
+            color_type = f"{{ {joined} }}"
+        elif tag_lower == "product":
+            sub_col_names = [idchild.text.strip() for idchild in child.findall("id")]
+            color_type = f"product({','.join(sub_col_names)})"
+        elif tag_lower == "alias":
+            a_id = child.find("id")
+            if a_id is not None and a_id.text:
+                alias_target = a_id.text.strip()
+        elif tag_lower == "list":
+            l_id = child.find("id")
+            if l_id is not None and l_id.text:
+                list_target = l_id.text.strip()
+        # ... handle other tags as needed
+
+    # Now assemble from alias/list/timed
+    if alias_target and list_target:
+        # This combination is odd, but let's ignore or handle if needed
+        pass
+    elif alias_target:
+        # "colset X = <alias_target> timed;" if timed_flag else just <alias_target>
+        base_str = alias_target
+        if timed_flag:
+            color_type = f"{base_str} timed"
+        else:
+            color_type = base_str
+    elif list_target:
+        color_type = f"list {list_target}"
+    else:
+        if not color_type:
+            color_type = "string"
+
+    if timed_flag and not alias_target and not color_type.endswith("timed"):
+        if color_type and "timed" not in color_type:
+            color_type += " timed"
+
+    return f"colset {color_name} = {color_type};"
+
+import xml.etree.ElementTree as ET
+import re
+from typing import Dict, Any, List, Optional, Union, Set
+
+
 def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
     """
     Parse a CPN Tools-like XML file and return a dictionary
@@ -14,11 +109,18 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
         "evaluationContext": null or "some string with ML code"
       }
 
-    This version handles:
-      - A broader range of color set constructs,
-      - Transition guard extraction from <condition><annot><text>,
-      - Transition variables from <code><ml>,
-      - Capturing ML code from <globbox><ml> into evaluationContext.
+    Handles:
+      - color set constructs via parse_color_element(color_elem),
+      - transition guards from <condition><annot><text>,
+      - transition variables from <code><ml>,
+      - ML code from <globbox><block><ml> and transition <code><ml>
+        into evaluationContext,
+      - HCPN flattening:
+          * substitution transitions are dropped;
+          * each page is a namespace (<page_name>.<name>);
+          * port places are not created as separate places;
+            instead, any reference to a port place is redirected
+            to its socket place via portsock mapping.
     """
 
     tree = ET.parse(xml_path)
@@ -32,142 +134,92 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
     transitions: List[Dict[str, Any]] = []
     initial_marking: Dict[str, Dict[str, Any]] = {}
 
-    # Maps from CPN <place id="..."> or <trans id="..."> to the displayed name in <text>
+    # Maps from CPN <place id="..."> or <trans id="..."> to the displayed name
     place_id_to_name: Dict[str, str] = {}
     trans_id_to_name: Dict[str, str] = {}
 
-    # Will hold code from <globbox><ml> as a single string, or None if none is found
     evaluation_context: Optional[str] = None
 
+    # Accumulate all ML code here (globbox + transition actions)
+    eval_chunks: List[str] = []
+
     # ------------------------------------------------------------------
-    # 1. Parse color sets in <globbox> -> <color>
-    #    Also gather any <ml> content for the evaluationContext.
+    # 1. Parse color sets + globbox ML
     # ------------------------------------------------------------------
     globbox_elem = root.find(".//cpnet/globbox")
 
-    def parse_color_element(color_elem: ET.Element) -> str:
-        """
-        Convert a <color> element into a 'colset <Name> = <Type>;' string.
-        If <layout> is present, we use that text directly (like "colset MYCOL = int;").
-        Otherwise, we inspect child tags to guess the color definition.
-        """
-        # 1) Extract color name from <id> child
-        name_elt = color_elem.find("id")
-        if name_elt is not None and name_elt.text:
-            color_name = name_elt.text.strip()
-        else:
-            color_name = "UnknownColor"
-
-        # 2) If there's a <layout> child, use that text directly.
-        #    Typically <layout> is something like: "colset UNIT_TIMED = UNIT timed;"
-        layout_elt = color_elem.find("layout")
-        if layout_elt is not None and layout_elt.text:
-            # Just return that line as is (trim any whitespace).
-            layout_text = layout_elt.text.strip()
-            return layout_text
-
-        # 3) Otherwise, build from known child tags:
-        color_type = ""
-        timed_flag = False
-        alias_target = None
-        list_target = None
-
-        for child in color_elem:
-            tag_lower = child.tag.lower()
-            if tag_lower == "int":
-                color_type = "int"
-            elif tag_lower == "real":
-                color_type = "real"
-            elif tag_lower == "string":
-                color_type = "string"
-            elif tag_lower == "bool":
-                color_type = "bool"
-            elif tag_lower == "unit":
-                color_type = "unit"
-            elif tag_lower == "intinf":
-                color_type = "intinf"
-            elif tag_lower == "time":
-                color_type = "time"
-            elif tag_lower == "timed":
-                timed_flag = True
-            elif tag_lower == "enum":
-                # gather enumerated items from <id> sub-elements
-                item_texts = []
-                for idchild in child.findall("id"):
-                    val = idchild.text.strip()
-                    item_texts.append(val)
-                joined = ", ".join(f"'{x}'" for x in item_texts)
-                color_type = f"{{ {joined} }}"
-            elif tag_lower == "product":
-                sub_col_names = [idchild.text.strip() for idchild in child.findall("id")]
-                color_type = f"product({','.join(sub_col_names)})"
-            elif tag_lower == "alias":
-                a_id = child.find("id")
-                if a_id is not None and a_id.text:
-                    alias_target = a_id.text.strip()
-            elif tag_lower == "list":
-                l_id = child.find("id")
-                if l_id is not None and l_id.text:
-                    list_target = l_id.text.strip()
-            # ... handle other tags as needed
-
-        # Now assemble from alias/list/timed
-        if alias_target and list_target:
-            # This combination is odd, but let's ignore or handle if needed
-            pass
-        elif alias_target:
-            # "colset X = <alias_target> timed;" if timed_flag else just <alias_target>
-            base_str = alias_target
-            if timed_flag:
-                color_type = f"{base_str} timed"
-            else:
-                color_type = base_str
-        elif list_target:
-            color_type = f"list {list_target}"
-        else:
-            if not color_type:
-                color_type = "string"
-
-        if timed_flag and not alias_target and not color_type.endswith("timed"):
-            if color_type and "timed" not in color_type:
-                color_type += " timed"
-
-        return f"colset {color_name} = {color_type};"
-
     if globbox_elem is not None:
-        # Parse <color> definitions
         for color_elem in globbox_elem.findall(".//color"):
-            colset_def = parse_color_element(color_elem)
+            colset_def = parse_color_element(color_elem)  # you already have this helper
             if colset_def.strip():
                 color_sets.append(colset_def)
 
-        # Parse <ml> content (if any) to store in evaluationContext
-        # We'll concatenate all <ml> blocks into one multi-line string.
-        ml_blocks = globbox_elem.findall("ml")
-        if ml_blocks:
-            lines = []
-            for mlb in ml_blocks:
-                if mlb.text and mlb.text.strip():
-                    lines.append(mlb.text.strip())
-            if lines:
-                evaluation_context = "\n\n".join(lines)
+        # CHANGED HERE: CPN Tools stores code as <globbox><block><ml>...</ml>
+        # so we must search for block/ml, not bare ml under globbox.
+        ml_blocks = globbox_elem.findall(".//block/ml")
+        for mlb in ml_blocks:
+            if mlb.text and mlb.text.strip():
+                eval_chunks.append(mlb.text.strip())
 
     # ------------------------------------------------------------------
-    # 2. Parse <page> for Places, Transitions, Arcs
+    # 2. Pages + HCPN pre-scan
     # ------------------------------------------------------------------
-    page_elem = root.find(".//cpnet/page")
-    if page_elem is not None:
-        # ---------------------
-        # 2a. Places
-        # ---------------------
+    page_elements = root.findall(".//cpnet/page")
+
+    # HCPN: substitution transitions and port→socket place mapping
+    subst_trans_ids: Set[str] = set()
+    port_to_socket: Dict[str, str] = {}
+
+    for page_elem in page_elements:
+        for trans_elem in page_elem.findall("trans"):
+            subst = trans_elem.find("subst")
+            if subst is None:
+                continue
+
+            tid = trans_elem.get("id", "")
+            if tid:
+                subst_trans_ids.add(tid)
+
+            portsock_str = subst.get("portsock", "")
+            # portsock format: (port1,socket1)(port2,socket2)...
+            pairs = re.findall(r"\(([^,]+),([^()]+)\)", portsock_str)
+            for port_id, sock_id in pairs:
+                port_to_socket[port_id.strip()] = sock_id.strip()
+
+    # helper: follow port -> socket chain to get the "real" place id
+    def resolve_place_id(pid: str) -> str:
+        while pid in port_to_socket:
+            pid = port_to_socket[pid]
+        return pid
+
+    # ------------------------------------------------------------------
+    # 3. FIRST PASS: create real (socket / non-port) places + names
+    # ------------------------------------------------------------------
+    for page_elem in page_elements:
+        pageattr = page_elem.find("pageattr")
+        page_name = pageattr.get("name", "PAGE") if pageattr is not None else "PAGE"
+
+        print(f"Page element {page_name} found, parsing places (pass 1).")
+
         for place_elem in page_elem.findall("place"):
             pid = place_elem.get("id", "")
-            # The user-friendly name is typically from <text>
+
+            # skip port places; they will be redirected to their socket
+            if pid in port_to_socket:
+                continue
+
+            # user-friendly base name from <text>
             text_elt = place_elem.find("text")
-            place_name = text_elt.text.strip() if (text_elt is not None and text_elt.text) else pid
+            base_place_name = (
+                text_elt.text.strip()
+                if (text_elt is not None and text_elt.text)
+                else pid
+            )
+
+            place_name = f"{page_name}.{base_place_name}"
             place_id_to_name[pid] = place_name
 
-            # find color set from <type><text> or <type><id>, or fallback
+            # color set from <type><text> or <type><id>, or fallback
             color_set_name = "UnknownColorSet"
             type_elem = place_elem.find("type")
             if type_elem is not None:
@@ -184,39 +236,96 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
                 "colorSet": color_set_name
             })
 
-            # ---------- Initial Marking ----------
-            initmark_elem = place_elem.find("initmark")
-            if initmark_elem is not None:
-                im_text_elt = initmark_elem.find("text")
-                if im_text_elt is not None and im_text_elt.text:
-                    marking_expr = im_text_elt.text.strip()
-                    place_tokens, place_timestamps = parse_marking_expr(marking_expr)
-                    if place_tokens:
-                        if any(ts != 0.0 for ts in place_timestamps):
-                            initial_marking[place_name] = {
-                                "tokens": place_tokens,
-                                "timestamps": place_timestamps
-                            }
-                        else:
-                            initial_marking[place_name] = {
-                                "tokens": place_tokens
-                            }
+    # ------------------------------------------------------------------
+    # 4. SECOND PASS: initial markings (redirect ports to sockets)
+    # ------------------------------------------------------------------
+    for page_elem in page_elements:
+        pageattr = page_elem.find("pageattr")
+        page_name = pageattr.get("name", "PAGE") if pageattr is not None else "PAGE"
 
-        # ---------------------
-        # 2b. Transitions
-        # ---------------------
-        # We'll collect arcs in a separate structure, keyed by transition name
+        print(f"Page element {page_name} found, parsing initial markings (pass 2).")
+
+        for place_elem in page_elem.findall("place"):
+            pid = place_elem.get("id", "")
+
+            # resolve port→socket (or identity if non-port)
+            root_pid = resolve_place_id(pid)
+            place_name = place_id_to_name.get(root_pid)
+            if place_name is None:
+                continue
+
+            initmark_elem = place_elem.find("initmark")
+            if initmark_elem is None:
+                continue
+
+            im_text_elt = initmark_elem.find("text")
+            if im_text_elt is None or not im_text_elt.text:
+                continue
+
+            marking_expr = im_text_elt.text.strip()
+            place_tokens, place_timestamps = parse_marking_expr(marking_expr)
+            if not place_tokens:
+                continue
+
+            existing = initial_marking.get(place_name)
+            if existing:
+                # merge tokens
+                old_tokens = existing.get("tokens", [])
+                old_ts = existing.get("timestamps", [0.0] * len(old_tokens))
+                new_tokens = old_tokens + place_tokens
+                new_ts = old_ts + place_timestamps
+                if any(ts != 0.0 for ts in new_ts):
+                    initial_marking[place_name] = {
+                        "tokens": new_tokens,
+                        "timestamps": new_ts
+                    }
+                else:
+                    initial_marking[place_name] = {
+                        "tokens": new_tokens
+                    }
+            else:
+                if any(ts != 0.0 for ts in place_timestamps):
+                    initial_marking[place_name] = {
+                        "tokens": place_tokens,
+                        "timestamps": place_timestamps
+                    }
+                else:
+                    initial_marking[place_name] = {
+                        "tokens": place_tokens
+                    }
+
+    # ------------------------------------------------------------------
+    # 5. Transitions + Arcs (using resolve_place_id for ports)
+    # ------------------------------------------------------------------
+    for page_elem in page_elements:
+        pageattr = page_elem.find("pageattr")
+        page_name = pageattr.get("name", "PAGE") if pageattr is not None else "PAGE"
+
+        # 5a. Name transitions on this page
         for trans_elem in page_elem.findall("trans"):
             tid = trans_elem.get("id", "")
+
+            # skip substitution transitions in flat model
+            if tid in subst_trans_ids:
+                continue
+
             text_elt = trans_elem.find("text")
-            trans_name = text_elt.text.strip() if (text_elt is not None and text_elt.text) else tid
+            base_trans_name = (
+                text_elt.text.strip()
+                if (text_elt is not None and text_elt.text)
+                else tid
+            )
+            trans_name = f"{page_name}.{base_trans_name}"
+
             trans_id_to_name[tid] = trans_name
 
-        trans_arcs = {tn: {"inArcs": [], "outArcs": []} for tn in trans_id_to_name.values()}
+        # per-page arcs map
+        trans_arcs = {
+            tn: {"inArcs": [], "outArcs": []}
+            for tn in trans_id_to_name.values()
+        }
 
-        # ---------------------
-        # 2c. Arcs (inArcs / outArcs)
-        # ---------------------
+        # 5b. Arcs
         for arc_elem in page_elem.findall("arc"):
             orientation = arc_elem.get("orientation", "")  # "PtoT", "TtoP", "bothdir", ...
             placeend = arc_elem.find("placeend")
@@ -227,6 +336,15 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
             place_idref = placeend.get("idref", "")
             trans_idref = transend.get("idref", "")
 
+            # drop arcs going to substitution transitions
+            if trans_idref in subst_trans_ids:
+                continue
+
+            # resolve port→socket for the place
+            root_pid = resolve_place_id(place_idref)
+            place_name = place_id_to_name.get(root_pid, "UnknownPlace")
+            trans_name = trans_id_to_name.get(trans_idref, "UnknownTrans")
+
             # Expression from <annot><text>
             arc_expr = ""
             annot_elt = arc_elem.find("annot")
@@ -235,8 +353,9 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
                 if text_sub is not None and text_sub.text:
                     arc_expr = text_sub.text.strip()
 
-            place_name = place_id_to_name.get(place_idref, "UnknownPlace")
-            trans_name = trans_id_to_name.get(trans_idref, "UnknownTrans")
+            # ensure entry exists
+            if trans_name not in trans_arcs:
+                trans_arcs[trans_name] = {"inArcs": [], "outArcs": []}
 
             if orientation == "PtoT":
                 trans_arcs[trans_name]["inArcs"].append({
@@ -248,8 +367,7 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
                     "place": place_name,
                     "expression": arc_expr
                 })
-            elif orientation == "bothdir":
-                # Treat it as both input and output arc if needed
+            elif orientation == "BOTHDIR" or orientation == "bothdir":
                 trans_arcs[trans_name]["inArcs"].append({
                     "place": place_name,
                     "expression": arc_expr
@@ -259,41 +377,56 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
                     "expression": arc_expr
                 })
 
-        # Now build final "transitions" list,
-        # including guard and variables from the XML (if present).
+        # 5c. Build transitions list for this page
         for trans_elem in page_elem.findall("trans"):
             tid = trans_elem.get("id", "")
+
+            # Skip substitution transitions
+            if tid in subst_trans_ids:
+                continue
+
             tname = trans_id_to_name.get(tid, tid)
 
-            # 1) Guard
+            # Guard
             guard_text = ""
-            cond_annot = trans_elem.find("./condition/annot/text")
+            cond_annot = trans_elem.find("./cond/text")
             if cond_annot is not None and cond_annot.text:
                 guard_text = cond_annot.text.strip()
 
-            # 2) Variables (or action code) from <code><ml>
-            variables_list = []
-            code_ml_elem = trans_elem.find("./code/ml")
-            if code_ml_elem is not None and code_ml_elem.text:
-                # For simplicity, store each non-blank line as a separate "variable" entry.
-                # Adjust to parse them more cleverly if needed.
-                raw_ml = code_ml_elem.text.strip()
-                variables_list = [ln.strip() for ln in raw_ml.splitlines() if ln.strip()]
+            # Delay
+            delay_text = ""
+            delay_annot = trans_elem.find("./time/text")
+            if delay_annot is not None and delay_annot.text:
+                delay_text = delay_annot.text.strip()
 
-            # 3) Arc info
+            # Action code from <code><text>
+            action: List[str] = []
+            code_action_elem = trans_elem.find("./code/text")
+            if code_action_elem is not None and code_action_elem.text:
+                raw_action = code_action_elem.text.strip()
+                action.append(raw_action)
+
+            action = "".join(action)
+
+            # Arc info
             arcs_data = trans_arcs.get(tname, {"inArcs": [], "outArcs": []})
 
             transitions.append({
                 "name": tname,
                 "guard": guard_text,
-                "variables": variables_list,
-                "transitionDelay": 0,
+                "action": action,
+                "transitionDelay": delay_text,
                 "inArcs": arcs_data["inArcs"],
                 "outArcs": arcs_data["outArcs"]
             })
 
     # ------------------------------------------------------------------
-    # 3. Build final dictionary
+    # 6. Build evaluation_context from collected ML
+    # ------------------------------------------------------------------
+    evaluation_context = "\n\n".join(eval_chunks) if eval_chunks else None
+
+    # ------------------------------------------------------------------
+    # 7. Final dictionary
     # ------------------------------------------------------------------
     result = {
         "colorSets": color_sets,
@@ -304,6 +437,7 @@ def cpn_xml_to_json(xml_path: str) -> Dict[str, Any]:
     }
 
     return result
+
 
 
 # ----------------------------------------------------------------------

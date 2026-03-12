@@ -12,7 +12,7 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
     Input and output tokens for each event are considered as related objects.
     The object type is derived from the place's color set.
     """
-    marking = initial_marking
+    marking = copy.deepcopy(initial_marking)
 
     # Data structures to build the OCEL
     event_list = []
@@ -74,7 +74,7 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
 
         # For input arcs
         for arc in cpn.get_input_arcs(t):
-            values, _ = context.evaluate_arc(arc.expression, binding)
+            values, _ = context.evaluate_input_arc(arc.expression, binding)
             otype = get_object_type_from_colorset(arc.source)  # derive from source place's color set
             for v in values:
                 obj_id = make_object_id(v)
@@ -85,7 +85,7 @@ def simulate_cpn_to_ocel(cpn: CPN, initial_marking: Marking, context: Evaluation
 
         # For output arcs
         for arc in cpn.get_output_arcs(t):
-            values, _ = context.evaluate_arc(arc.expression, binding)
+            values, _ = context.evaluate_output_arc(arc.expression, binding)
             otype = get_object_type_from_colorset(arc.target)  # derive from target place's color set
             for v in values:
                 obj_id = make_object_id(v)

@@ -26,6 +26,8 @@ def equiv_marking_to_key(marking: Marking) -> Tuple[int, Tuple[Tuple[str, Tuple[
     """
     place_entries = []
     for place_name, ms in sorted(marking._marking.items(), key=lambda x: x[0]):
+        if not ms.tokens:
+            continue
         # Convert tokens to a sorted tuple of (value, timestamp), ensuring both are hashable
         token_list = tuple(
             sorted((make_hashable(t.value), make_hashable(t.timestamp)) for t in ms.tokens)

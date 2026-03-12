@@ -30,7 +30,7 @@ from cpnpy.cpn.colorsets import (
     ProductColorSet,
     DictionaryColorSet,
     ListColorSet,
-    ColorSetParser,
+    ColorSetParser, RecordColorSet,
 )
 
 # -----------------------------------------------------------------------------------
@@ -149,6 +149,13 @@ def generate_color_set_definitions(cpn: CPN):
             # *** Recursive call ensures constituent is defined first ***
             sub_name = define_colorset(cs.element_cs)
             base_def = f"colset {assigned_name} = list {sub_name}{timed_str};"
+        elif isinstance(cs, RecordColorSet):
+            field_defs = []
+            for field_name, field_cs in cs.field_types:
+                field_cs_name = define_colorset(field_cs)
+                field_defs.append(f"{field_name}: {field_cs_name}")
+            fields_str = ", ".join(field_defs)
+            base_def = f"colset {assigned_name} = record {{ {fields_str} }}{timed_str};"
         else:
             # Clean up potentially assigned name if we error out
             if assigned_name in used_definition_names:

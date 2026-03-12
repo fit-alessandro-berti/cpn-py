@@ -3,7 +3,7 @@ import html
 import tempfile
 import os
 from cpnpy.cpn.cpn_imp import *
-
+import inspect
 
 def format_token(tok, token_max_len=200):
     """
@@ -55,7 +55,15 @@ class CPNGraphViz:
         """
         self.format = format
         self.graph = graphviz.Digraph(format=self.format, directory=self.temp_dir)
-        self.graph.attr(rankdir="LR")
+        # global layout hints
+        self.graph.attr(
+            rankdir="LR",  # left->right
+            splines="spline",  # nicer curves
+            overlap="false",  # try to remove overlaps
+            newrank="true",  # better handling with clusters
+            pack="true",  # pack clusters more tightly
+            packmode="clust",
+        )
 
         # Add Places
         for place in cpn.places:
@@ -106,6 +114,19 @@ class CPNGraphViz:
             if transition.transition_delay > 0:
                 lines.append(f"Delay: {transition.transition_delay}")
 
+            if transition.priority != 0:
+                lines.append(f"Priority: {transition.priority}")
+
+            if transition.action is not None:
+
+                # TODO, remove str fallback support
+                if isinstance(transition.action, str):
+                    function_code = transition.action
+                else:
+                    function_code = inspect.getsource(transition.action)
+                lines.append("Action:")
+                lines.append(function_code)
+
             # Combine into a single label
             raw_label = "\\n".join(lines)
             # Summarize/truncate if needed
@@ -139,6 +160,84 @@ class CPNGraphViz:
         if self.graph is None:
             raise RuntimeError("Graph not created. Call apply() first.")
         self.graph.view()
+
+    from pyvis.network import Network
+
+    def view_interactive(self):
+
+        import pydot
+
+        # --- compatibility patch for networkx.nx_pydot.from_pydot ---
+        def _patch_pydot_get_strict():
+            for cls in (pydot.Dot, pydot.Graph):
+                if hasattr(cls, "get_strict"):
+                    orig = cls.get_strict
+
+                    def _wrapped(self, *args, **kwargs):
+                        # ignore extra args networkx passes
+                        return orig(self)
+
+                    cls.get_strict = _wrapped
+
+        _patch_pydot_get_strict()
+        # -------------------------------------------------------------
+
+        import networkx as nx
+        from pyvis.network import Network
+
+        # 1. Get DOT source from existing graphviz object
+        dot_src = self.graph.source
+
+        # 2. Parse DOT -> pydot -> networkx
+        pydot_graphs = pydot.graph_from_dot_data(dot_src)
+        pydot_graph = pydot_graphs[0]
+        G = nx.nx_pydot.from_pydot(pydot_graph)
+
+        # 3. Build interactive net
+        net = Network(directed=True, height="600px", width="100%", notebook=False)
+        net.barnes_hut()  # draggable physics layout
+        net.show_buttons(["physics"])  # optional UI panel
+
+        # --- nodes: transitions as boxes, places as ellipses ---
+        for n, data in G.nodes(data=True):
+            label = data.get("label", n)
+            title = str(n)  # tooltip
+
+            gv_shape = str(data.get("shape", "ellipse")).lower()
+            if gv_shape in ("box", "rect", "rectangle"):
+                shape = "box"  # transitions
+            else:
+                shape = "ellipse"  # places / default
+
+            net.add_node(
+                n,
+                label=label,
+                title=title,
+                shape=shape,
+                font={"size": 30},
+            )
+
+        # --- edges: show arc inscriptions + thicker lines ---
+        for u, v, data in G.edges(data=True):
+            label = data.get("label", "")  # arc inscription from DOT
+
+            # try to reuse DOT penwidth if present, else default thicker edge
+            try:
+                width = float(data.get("penwidth", 2.5))
+            except (TypeError, ValueError):
+                width = 2.5
+
+            net.add_edge(
+                u,
+                v,
+                label=label,
+                arrows="to",
+                width=width,
+                font={"size": 30, "align": "top"},
+            )
+
+        # 4. Export to HTML (script mode)
+        net.show("cpn_net_interactive.html", notebook=False)
 
     def save(self, filename: str):
         """
