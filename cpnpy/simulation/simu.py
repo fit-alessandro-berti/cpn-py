@@ -5,88 +5,91 @@ from cpnpy.cpn.colorsets import ColorSetParser
 from cpnpy.cpn.cpn_imp import CPN, Marking, EvaluationContext, Arc, Transition, Place
 
 
+def get_enabled_transitions(
+    cpn: CPN,
+    marking: Marking,
+    context: EvaluationContext,
+    only_best_priority: bool = True
+) -> list[Transition]:
+    """
+    Get all transitions currently enabled at the marking's global_clock.
+    If only_best_priority=True (default), only return transitions with the highest priority (lowest numeric value).
+    """
+    enabled = [
+        t for t in cpn.transitions
+        if cpn.is_enabled(t, marking, context)
+    ]
+
+    if not enabled or not only_best_priority:
+        return enabled
+
+    # Lower priority value means higher priority.
+    best_pri = min(getattr(t, "priority", 0) for t in enabled)
+    return [t for t in enabled if getattr(t, "priority", 0) == best_pri]
+
+
 def simulate_until_deadlock(
     cpn: CPN,
     marking: Marking,
     context: EvaluationContext,
     visualizer=None,
     max_steps: int = 1000,
-    max_time: Optional[int] = None,   # simulation time limit (global_clock)
+    max_time: Optional[int] = None,
 ):
     """
-    Run the CPN until:
-      - no transitions are enabled AND
-      - time cannot advance further
-    or until one of the limits is hit:
-      - max_steps fired transitions
-      - max_time reached (simulation time, in same units as global_clock)
+    Run the CPN simulation until no more transitions are enabled and time cannot advance,
+    or until limits (max_steps, max_time) are reached.
     """
     step = 0
 
     while step < max_steps:
-        # Stop if we've reached the time horizon
+        # Check time limit
         if max_time is not None and marking.global_clock >= max_time:
             print(f"Reached max_time={max_time}, stopping simulation.")
             break
 
-        # 1) Fire all transitions enabled at the current global time
+        # 1) Fire all transitions enabled at the current time (respecting priorities)
         while True:
-            enabled = [
-                t for t in cpn.transitions
-                if cpn.is_enabled(t, marking, context)
-            ]
-
+            enabled = get_enabled_transitions(cpn, marking, context)
             if not enabled:
-                break  # no more transitions at this time
+                break
 
-            # extra safety: respect max_time before firing
+            # Safety check for max_time before firing
             if max_time is not None and marking.global_clock > max_time:
                 print(f"Global time {marking.global_clock} > max_time={max_time}, stopping.")
                 return marking
 
-            # Lower value => higher priority. Only choose among best-priority transitions.
-            best_pri = min(getattr(t, "priority", 0) for t in enabled)
-            best = [t for t in enabled if getattr(t, "priority", 0) == best_pri]
-
-            # choose one (random among ties to avoid bias)
-            t = random.choice(best)
-
+            # Choose a random transition among those with the best priority
+            t = random.choice(enabled)
             step += 1
 
             print(f"[step {step}] Firing {t.name} at time {marking.global_clock}")
             cpn.fire_transition(t, marking, context)
 
             if visualizer is not None:
-                print("Visualizing current marking...")
-                print("Current marking: ", marking)
+                # Note: This is a placeholder for older-style visualizers.
+                # The streamlit visualizer doesn't use this callback.
+                pass
 
             if step >= max_steps:
                 print("Reached max_steps, stopping simulation.")
                 return marking
 
-        # 2) After we've exhausted all transitions for this time, advance the clock
+        # 2) Advance the clock after exhausting current events
         before = marking.global_clock
-
-        # If we’re already at or beyond max_time, don’t advance further
         if max_time is not None and before >= max_time:
-            print(f"Current time {before} >= max_time={max_time}, stopping before advancing time.")
             break
 
         cpn.advance_global_clock(marking)
         after = marking.global_clock
-
         print(f"Advancing time: {before} -> {after}")
 
-        # If time didn’t move, nothing more can ever fire
         if after == before:
-            print("No more enabled transitions and time cannot advance. Stopping.")
+            print("No more enabled transitions and time cannot advance. Deadlock.")
             break
 
-        # If we overshoot max_time after advancing, clamp / stop
         if max_time is not None and after > max_time:
             print(f"Time advanced past max_time={max_time} (now {after}), stopping.")
-            # Optionally clamp:
-            # marking.global_clock = max_time
             break
 
     return marking

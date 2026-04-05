@@ -36,11 +36,14 @@ class OutputScope:
         else:
             self._data[name] = value
 
+    def __setitem__(self, key: str, value: Any):
+        self._data[key] = value
+
     def as_dict(self) -> dict:
         return dict(self._data)
 
 
-TransitionAction = Callable[[InputView, OutputScope], None]
+TransitionAction = Union[Callable[[InputView, OutputScope], None], str]
 
 
 # -----------------------------------------------------------------------------------
@@ -223,21 +226,28 @@ class EvaluationContext:
             return [val], delay
 
 
-    def evaluate_output_arc(self, arc_expr: str, binding: Dict[str, Any]) -> (List[Any], int):
+    def evaluate_output_arc(self, arc_expr: str, binding: Dict[str, Any], 
+                            target_cs: Optional[ColorSet] = None) -> (List[Any], int):
         expr_part, delay = self._parse_expr_and_delay(arc_expr, binding)
         val = eval(expr_part, self.env, binding)
+
+        if target_cs and target_cs.is_member(val):
+            return [val], delay
 
         if isinstance(val, list):
             return val, delay
         return [val], delay
 
-    def evaluate_action(
-        self,
-        action: TransitionAction,
-        binding: Dict[str, Any]
-    ):
+    def evaluate_action(self, action: TransitionAction, binding: Dict[str, Any]):
         inp = InputView(binding)
         out = OutputScope()
+
+        if isinstance(action, str):
+            # Execute string action in the environment with inp, out and binding variables
+            local_vars = {"input": inp, "output": out}
+            local_vars.update(binding)
+            exec(action, self.env, local_vars)
+            return out
 
         # --- rebind function so its globals == self.env ---
         action_with_env = types.FunctionType(
@@ -247,9 +257,7 @@ class EvaluationContext:
             argdefs=action.__defaults__,
             closure=action.__closure__,
         )
-
         action_with_env(inp, out)
-
         return out
 
     def __copy__(self):
@@ -427,35 +435,50 @@ class CPN:
         if not self._check_enabled_with_binding(t, marking, context, binding):
             raise RuntimeError(f"Transition {t.name} is not enabled under the found binding.")
 
-        # Remove tokens
-        for arc in self.get_input_arcs(t):
-            values, _ = context.evaluate_input_arc(arc.expression, binding)
-            marking.remove_tokens(arc.source.name, values)
-
-        # Execute action if any
+        # 1. Execute action if any
         out = None
         if t.action is not None:
             out = context.evaluate_action(t.action, binding)
 
-        # Add tokens with proper timestamps
+        # 2. Prepare output tokens (risky part)
         locals_after_action = {}
         locals_after_action.update(binding)
         if out is not None:
             locals_after_action.update(out.as_dict())
+        
+        output_tokens = [] # List of (place_name, value, final_ts)
         for arc in self.get_output_arcs(t):
-            values, arc_delay = context.evaluate_output_arc(arc.expression, locals_after_action)
+            values, arc_delay = context.evaluate_output_arc(arc.expression, locals_after_action, 
+                                                           target_cs=arc.target.colorset)
             for v in values:
                 place = arc.target
-
-                # validate token value against place colorset
                 if not place.colorset.is_member(v):
                     raise Exception(f"Token value {v} is not a member of colorset {place.colorset} for place {place.name}")
-
+                
                 new_timestamp = marking.global_clock + t.transition_delay + arc_delay
-                if place.colorset.timed:
-                    marking.add_tokens(place.name, [v], timestamp=new_timestamp)
-                else:
-                    marking.add_tokens(place.name, [v], timestamp=0)
+                final_ts = new_timestamp if place.colorset.timed else 0
+                output_tokens.append((place.name, v, final_ts))
+
+        # 3. If everything is valid, perform atomic updates
+        firing_info = {"in": [], "out": []}
+        
+        # Remove tokens
+        for arc in self.get_input_arcs(t):
+            values, _ = context.evaluate_input_arc(arc.expression, binding)
+            marking.remove_tokens(arc.source.name, values)
+            firing_info["in"].append({"arc": f"{arc.source.name}|{arc.target.name}", "count": len(values)})
+
+        # Add tokens
+        # We need to track it by arc
+        for arc in self.get_output_arcs(t):
+            values, arc_delay = context.evaluate_output_arc(arc.expression, locals_after_action, 
+                                                           target_cs=arc.target.colorset)
+            firing_info["out"].append({"arc": f"{arc.source.name}|{arc.target.name}", "count": len(values)})
+
+        for place_name, v, ts in output_tokens:
+            marking.add_tokens(place_name, [v], timestamp=ts)
+            
+        return firing_info
 
     def _check_enabled_with_binding(self, t: Transition, marking: Marking, context: EvaluationContext,
                                     binding: Dict[str, Any]) -> bool:
