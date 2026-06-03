@@ -166,15 +166,6 @@ def main():
     )
     viz.render(height=800)
 
-    st.sidebar.markdown("""
----
-**Tips**
-- **Green** transitions are enabled; select & fire them.
-- Click a **circle (place)** to see all tokens.
-- Click a **rectangle (transition)** to read its action code.
-- Drag nodes freely — they stay put.
-""")
-
 
 if __name__ == "__main__":
     main()

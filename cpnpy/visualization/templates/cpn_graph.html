@@ -1,0 +1,426 @@
+        <html>
+        <head>
+            <script src="{{VIS_JS_URL}}"></script>
+        <style>
+                body { margin: 0; overflow: hidden; }
+                #mynetwork {
+                    width: 100%;
+                    height: {{HEIGHT}}px;
+                    border: 1px solid #ddd;
+                    background: #fafafa;
+                }
+                #labels-container {
+                    position: absolute; top: 0; left: 0;
+                    pointer-events: none;
+                }
+                .corner-label {
+                    position: absolute;
+                    font: 11px Arial;
+                    white-space: nowrap;
+                    pointer-events: none;
+                }
+                .colorset-label {
+                    font: italic 11px Arial;
+                    color: #555;
+                }
+                .token-label {
+                    font: bold 11px Arial;
+                    color: #333;
+                }
+                .trans-ext-label {
+                    position: absolute;
+                    font: 11px Arial;
+                    white-space: nowrap;
+                    pointer-events: none;
+                    text-align: center;
+                }
+                .trans-top-label { color: black; }
+                .trans-bottom-label { color: black; }
+                .trans-bl-label { color: black; font-size: 11px; }
+                #overlay {
+                    position: absolute; top: 10px; right: 10px;
+                    width: 320px; max-height: 80%;
+                    background: rgba(255,255,255,0.97);
+                    border: 1px solid #ccc; border-radius: 8px;
+                    padding: 14px; display: none; overflow-y: auto;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+                    font-family: sans-serif; font-size: 13px;
+                    z-index: 100;
+                }
+                .overlay-header {
+                    font-weight: bold; border-bottom: 1px solid #eee;
+                    padding-bottom: 6px; margin-bottom: 10px;
+                    display: flex; justify-content: space-between;
+                }
+                .close-btn { cursor: pointer; color: #aaa; }
+                pre { background: #f4f4f4; padding: 8px; border-radius: 4px;
+                       font-size: 11px; overflow-x: auto; white-space: pre-wrap; }
+                .token-row { padding: 2px 0; }
+            </style>
+        </head>
+        <body>
+            <div id="mynetwork"></div>
+            <div id="labels-container"></div>
+            <div id="overlay">
+                <div class="overlay-header">
+                    <span id="overlay-title">Details</span>
+                    <span class="close-btn" onclick="hideOverlay()">✖</span>
+            </div>
+                <div id="overlay-content"></div>
+          </div>
+
+        <script>
+                const graphData = {{GRAPH_DATA_JSON}};
+                const anim = graphData.animation || {};
+                const TOKEN_DURATION = anim.phase_ms || 200;
+                const PHASE_GAP = anim.gap_ms || 25;
+                const TOKEN_STAGGER = anim.stagger_ms || 20;
+                const container = document.getElementById('mynetwork');
+                const STORAGE_KEY = "cpn_v1_" + btoa(graphData.nodes.map(n => n.id).join(",")).slice(0, 16);
+                const VIEW_KEY = STORAGE_KEY + "_v";
+                const SEL_KEY  = STORAGE_KEY + "_s";
+
+                const savedPos = localStorage.getItem(STORAGE_KEY);
+                if (savedPos) {
+                    try {
+                        const posMap = JSON.parse(savedPos);
+                        graphData.nodes.forEach(n => {
+                            if (posMap[n.id]) { n.x = posMap[n.id].x; n.y = posMap[n.id].y; }
+                        });
+                    } catch (e) {}
+                }
+
+                const options = {
+                    nodes: { font: { face: 'Arial' }, margin: 10 },
+                    edges: {
+                        smooth: false,
+                        color: { inherit: 'from' },
+                        arrows: { to: { enabled: true } }
+                    },
+                    physics: {
+                        enabled: !savedPos,
+                        solver: 'forceAtlas2Based',
+                        forceAtlas2Based: {
+                            gravitationalConstant: -100,
+                            centralGravity: 0.01,
+                            springLength: 100,
+                            springConstant: 0.08,
+                            nodeDistance: 180
+                        },
+                        stabilization: { iterations: 200 }
+                    },
+                    interaction: { hover: true, navigationButtons: false, keyboard: true }
+                };
+
+                function saveState() {
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(network.getPositions()));
+                    localStorage.setItem(VIEW_KEY, JSON.stringify({
+                        pos: network.getViewPosition(),
+                        scale: network.getScale()
+                    }));
+                }
+
+                const nodesDS = new vis.DataSet(graphData.nodes);
+                const edgesDS = new vis.DataSet(graphData.edges);
+                const network = new vis.Network(container, { nodes: nodesDS, edges: edgesDS }, options);
+
+                network.on("dragEnd", saveState);
+                network.on("zoom", saveState);
+                network.once("afterDrawing", () => {
+                    if (!localStorage.getItem(STORAGE_KEY)) saveState();
+                });
+
+                const savedView = localStorage.getItem(VIEW_KEY);
+                if (savedView) {
+                    try {
+                        const v = JSON.parse(savedView);
+                        network.moveTo({ position: v.pos, scale: v.scale, animation: false });
+                    } catch (e) {}
+                }
+
+                const labelsContainer = document.getElementById('labels-container');
+                const placeNodes = graphData.nodes.filter(n => n.type === 'place');
+                const transNodes = graphData.nodes.filter(n => n.type === 'transition');
+                const labelEls = {};
+                const transLabelEls = {};
+                placeNodes.forEach(node => {
+                    const tr = document.createElement('div');
+                    tr.className = 'corner-label colorset-label';
+                    tr.innerText = node.corner_tr || '';
+                    labelsContainer.appendChild(tr);
+                    const br = document.createElement('div');
+                    br.className = 'corner-label token-label';
+                    if (node.token_avail > 0 || node.token_future > 0) {
+                        let html = '';
+                        if (node.is_timed) {
+                            const parts = [];
+                            if (node.token_avail > 0) parts.push(`<span style="color:#27ae60">${node.token_avail}@</span>`);
+                            if (node.token_future > 0) parts.push(`<span style="color:black">${node.token_future}@</span>`);
+                            html = parts.join(', ');
+                        } else if (node.token_avail > 0) {
+                            html = `<span style="color:#27ae60">${node.token_avail}</span>`;
+                        }
+                        br.innerHTML = html;
+                    }
+                    labelsContainer.appendChild(br);
+                    labelEls[node.id] = { tr, br };
+                });
+
+                transNodes.forEach(node => {
+                    const top = document.createElement('div');
+                    top.className = 'trans-ext-label trans-top-label';
+                    top.innerText = node.external_top || '';
+                    labelsContainer.appendChild(top);
+                    const bottom = document.createElement('div');
+                    bottom.className = 'trans-ext-label trans-bottom-label';
+                    bottom.innerText = node.external_bottom || '';
+                    labelsContainer.appendChild(bottom);
+                    const bl = document.createElement('div');
+                    bl.className = 'trans-ext-label trans-bl-label';
+                    bl.innerText = node.external_bl || '';
+                    labelsContainer.appendChild(bl);
+                    transLabelEls[node.id] = { top, bottom, bl };
+                });
+
+                function updateCornerLabels() {
+                    placeNodes.forEach(node => {
+                        const els = labelEls[node.id];
+                        if (!els) return;
+                        try {
+                            const box = network.getBoundingBox(node.id);
+                            const rDom = network.canvasToDOM({x: box.right, y: 0}).x;
+                            const tDom = network.canvasToDOM({x: 0, y: box.top}).y;
+                            const bDom = network.canvasToDOM({x: 0, y: box.bottom}).y;
+                            els.tr.style.left = (rDom + 2) + 'px';
+                            els.tr.style.top  = (tDom - 5) + 'px';
+                            els.br.style.left = (rDom + 2) + 'px';
+                            els.br.style.top  = (bDom - 10) + 'px';
+                        } catch(e) {}
+                    });
+                    transNodes.forEach(node => {
+                        const els = transLabelEls[node.id];
+                        if (!els) return;
+                        try {
+                            const box = network.getBoundingBox(node.id);
+                            const tDom = network.canvasToDOM({x: 0, y: box.top}).y;
+                            const bDom = network.canvasToDOM({x: 0, y: box.bottom}).y;
+                            const hMid = network.canvasToDOM({x: (box.left + box.right)/2, y: 0}).x;
+                            els.top.style.left = hMid + 'px';
+                            els.top.style.top  = (tDom - 15) + 'px';
+                            els.top.style.transform = 'translateX(-50%)';
+                            els.bottom.style.left = hMid + 'px';
+                            els.bottom.style.top  = (bDom + 1) + 'px';
+                            els.bottom.style.transform = 'translateX(-50%)';
+                            const lDom = network.canvasToDOM({x: box.left, y: 0}).x;
+                            els.bl.style.left = (lDom - 4) + 'px';
+                            els.bl.style.top  = (bDom - 12) + 'px';
+                            els.bl.style.transform = 'translateX(-100%)';
+                        } catch(e) {}
+                    });
+                }
+
+                network.on("stabilized", () => {
+                    saveState();
+                    network.setOptions({ physics: { enabled: false } });
+                    updateCornerLabels();
+                });
+                network.on('afterDrawing', updateCornerLabels);
+
+                const inArcs = graphData.animate_in || [];
+                const outArcs = graphData.animate_out || [];
+                const DISABLED_TRANS_COLOR = {
+                    background: '#f8f9fa',
+                    border: '#adb5bd',
+                    highlight: { background: '#e9ecef', border: '#6c757d' },
+                };
+
+                function revertAnimatingTransition() {
+                    const t = graphData.animating_transition;
+                    if (!t) return;
+                    const enabled = graphData.enabled_names || [];
+                    if (enabled.includes(t)) return;
+                    try {
+                        nodesDS.update({ id: t, color: DISABLED_TRANS_COLOR });
+                    } catch (e) {}
+                }
+
+                function phaseDuration(arcs, phaseStart) {
+                    let end = phaseStart;
+                    arcs.forEach(entry => {
+                        const c = Math.max(1, entry.count || 1);
+                        end = Math.max(end, phaseStart + TOKEN_DURATION + (c - 1) * TOKEN_STAGGER);
+                    });
+                    return end;
+                }
+
+                const inEnd = phaseDuration(inArcs, 0);
+                const gap = (inArcs.length && outArcs.length) ? PHASE_GAP : 0;
+                const outStart = inEnd + gap;
+                const totalDuration = anim.total_duration_ms ?? phaseDuration(outArcs, outStart);
+
+                function tokenXY(sPos, ePos, t, isCurved) {
+                    if (!isCurved) {
+                        return {
+                            x: sPos.x + (ePos.x - sPos.x) * t,
+                            y: sPos.y + (ePos.y - sPos.y) * t
+                        };
+                    }
+                    const r = 0.2;
+                    const midX = (sPos.x + ePos.x) / 2;
+                    const midY = (sPos.y + ePos.y) / 2;
+                    const dx = ePos.x - sPos.x;
+                    const dy = ePos.y - sPos.y;
+                    const cpX = midX - dy * r;
+                    const cpY = midY + dx * r;
+                    return {
+                        x: (1-t)*(1-t)*sPos.x + 2*(1-t)*t*cpX + t*t*ePos.x,
+                        y: (1-t)*(1-t)*sPos.y + 2*(1-t)*t*cpY + t*t*ePos.y
+                    };
+                }
+
+                function drawArcTokens(ctx, arcs, phaseStart, elapsed) {
+                    arcs.forEach(entry => {
+                        const count = Math.max(1, entry.count || 1);
+                        const [fromId, toId] = entry.arc.split('|');
+                        let sPos, ePos;
+                        try {
+                            sPos = network.canvasToDOM(network.getPosition(fromId));
+                            ePos = network.canvasToDOM(network.getPosition(toId));
+                        } catch(e) { return; }
+                        const edge = edgesDS.get(entry.arc);
+                        const isCurved = edge && edge.is_curved;
+                        for (let i = 0; i < count; i++) {
+                            const local = elapsed - phaseStart - i * TOKEN_STAGGER;
+                            if (local < 0 || local >= TOKEN_DURATION) continue;
+                            const t = local / TOKEN_DURATION;
+                            const {x, y} = tokenXY(sPos, ePos, t, isCurved);
+                            ctx.beginPath();
+                            ctx.arc(x, y, 7, 0, 2 * Math.PI);
+                            ctx.fillStyle = '#27ae60';
+                            ctx.fill();
+                            ctx.strokeStyle = 'white';
+                            ctx.lineWidth = 2;
+                            ctx.stroke();
+                        }
+                    });
+                }
+
+                if (inArcs.length > 0 || outArcs.length > 0) {
+                    container.style.position = 'relative';
+                    const canvas = document.createElement('canvas');
+                    canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;width:100%;height:100%;z-index:99;';
+                    container.appendChild(canvas);
+                    const resize = () => {
+                        const r = container.getBoundingClientRect();
+                        canvas.width = r.width;
+                        canvas.height = r.height;
+                    };
+                    resize();
+                    window.addEventListener('resize', resize);
+                    const start = performance.now();
+                    const animFrame = (ts) => {
+                        const elapsed = ts - start;
+                        const ctx = canvas.getContext('2d');
+                        if (!ctx) return;
+                        ctx.clearRect(0, 0, canvas.width, canvas.height);
+                        drawArcTokens(ctx, inArcs, 0, elapsed);
+                        drawArcTokens(ctx, outArcs, outStart, elapsed);
+                        if (elapsed < totalDuration) {
+                            requestAnimationFrame(animFrame);
+                        } else {
+                            revertAnimatingTransition();
+                            window.removeEventListener('resize', resize);
+                            setTimeout(() => { if (canvas.parentNode) container.removeChild(canvas); }, 50);
+                        }
+                    };
+                    requestAnimationFrame(animFrame);
+                }
+
+                function syncStepModeTransitionPick(nodeId, node) {
+                    if (!graphData.sync_graph_select || node.type !== 'transition') return;
+                    const enabled = graphData.enabled_names || [];
+                    if (!enabled.includes(nodeId)) return;
+                    const qp = graphData.graph_select_qp;
+                    if (!qp) return;
+                    try {
+                        const url = new URL(window.parent.location.href);
+                        url.searchParams.set(qp, nodeId);
+                        window.parent.location.href = url.toString();
+                    } catch (e) {}
+                }
+
+                network.on("click", params => {
+                    if (params.nodes.length > 0) {
+                        const nodeId = params.nodes[0];
+                        const node = graphData.nodes.find(n => n.id === nodeId);
+                        localStorage.setItem(SEL_KEY, nodeId);
+                        if (node) {
+                            syncStepModeTransitionPick(nodeId, node);
+                            showOverlay(node);
+                        }
+                    } else {
+                        hideOverlay();
+                    }
+                });
+
+                const lastSel = localStorage.getItem(SEL_KEY);
+                if (lastSel) {
+                    const node = graphData.nodes.find(n => n.id === lastSel);
+                    if (node) showOverlay(node);
+                }
+
+                function showOverlay(node) {
+                    const overlay = document.getElementById('overlay');
+                    const title   = document.getElementById('overlay-title');
+                    const content = document.getElementById('overlay-content');
+                    overlay.style.display = 'block';
+                    if (node.type === 'transition') {
+                        title.innerHTML = '<b>' + node.id + '</b>';
+                        let html = '<div style="margin-top:10px">';
+                        html += '<b>Priority:</b><pre>' + node.priority + '</pre>';
+                        if (node.guard) {
+                            html += '<b>Guard:</b><pre>' + esc(node.guard) + '</pre>';
+                        } else {
+                            html += '<b>Guard:</b> <span style="font-weight:normal">none</span><br><br>';
+                        }
+                        if (node.delay > 0) {
+                            html += '<b>Delay:</b><pre>@+ ' + node.delay + '</pre>';
+                        } else {
+                            html += '<b>Delay:</b> <span style="font-weight:normal">none</span><br><br>';
+                        }
+                        if (node.action_code) {
+                            html += '<b>Action:</b><pre>' + esc(node.action_code) + '</pre>';
+                        } else {
+                            html += '<b>Action:</b> <span style="font-weight:normal">none</span><br>';
+                        }
+                        html += '</div>';
+                        content.innerHTML = html;
+          } else {
+                        title.innerHTML = '<b>' + node.id + '</b>: <i style="font-weight:normal">' + esc(node.colorset_name) + '</i>';
+                        let summary = node.is_timed ? '<b><span style="color:#27ae60">' + (node.token_avail || 0) + '@</span>, ' + (node.token_future || 0) + '@ tokens</b>' : '<b><span style="color:#27ae60">' + (node.token_avail || 0) + '</span> tokens</b>';
+                        let html = '<div style="margin-top:10px">' + summary + '</div><div style="margin-top:10px">';
+                        node.full_tokens.forEach(t => {
+                            const color = t.is_avail ? '#27ae60' : 'black';
+                            const ts = t.timestamp ? ' @' + t.timestamp : '';
+                            html += `<div class="token-row" style="color:${color}">${esc(t.value)}${ts}</div>`;
+            });
+                        if (!node.full_tokens.length) html += '<i>No tokens</i>';
+                        html += '</div>';
+                        content.innerHTML = html;
+        }
+                }
+
+                function hideOverlay() {
+                    document.getElementById('overlay').style.display = 'none';
+                    localStorage.removeItem(SEL_KEY);
+                }
+
+                function esc(text) {
+                    const d = document.createElement('div');
+                    d.textContent = String(text);
+                    return d.innerHTML;
+                }
+        </script>
+        </body>
+        </html>
+        
