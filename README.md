@@ -3,11 +3,18 @@
 `cpnpy` is a Python-based library designed to simulate Colored Petri Nets (CPNs) with optional time semantics. It provides classes and functions to define places, transitions, arcs, and markings, along with color sets and evaluation contexts to express guards, arc expressions, and timed behavior.
 
 **Key features include:**
-- Defining color sets (including `int`, `real`, `string`, enumerated, and product types) with optional timing.
-- Creating places and transitions, each associated with a specific color set and optional guard conditions.
+- Defining color sets (including `int`, `real`, `string`, enumerated, record, list, dict, and product types) with optional timing.
+- Creating places and transitions, each associated with a specific color set and optional guard conditions, **transition priority**, and **action blocks**.
 - Specifying arcs with expressions and delays that determine how tokens move through the net.
 - Managing tokens as multisets of timed or untimed values.
-- Simulating CPN behavior: checking transition enabling, firing transitions, and advancing time.
+- Simulating CPN behavior: checking transition enabling, firing transitions, advancing time, and running until deadlock (`simulate_until_deadlock`).
+- **Interactive Streamlit visualizer** — step/batch simulation, monitors, graph layout, and firing animation (`examples/streamlit_demo.py`).
+
+**Documentation (newer features, user perspective):**
+
+- [USER_GUIDE.md](USER_GUIDE.md) — priority, actions, record/list types, Streamlit UI, monitors, batch modes, graph layout (since commit `30528abf`)
+- [Streamlit visualizer developer patterns](docs/solutions/architecture-patterns/streamlit-visualizer-simplification-patterns.md) — rerun semantics and refactoring notes for contributors
+- [Domain vocabulary](CONCEPTS.md) — shared terms (marking, monitors, batch phases, etc.)
 
 ---
 
@@ -177,6 +184,18 @@ context = EvaluationContext(user_code=user_code)
    print("After advancing global clock:", marking.global_clock)
    # global_clock might now match the timestamp of the next future token.
    ```
+
+5. **Run until deadlock (script)**
+
+   For unattended simulation without the UI:
+
+   ```python
+   from cpnpy.simulation.simu import simulate_until_deadlock
+
+   final_marking = simulate_until_deadlock(cpn, marking, context, max_steps=1000, max_time=100)
+   ```
+
+   See [USER_GUIDE.md](USER_GUIDE.md) for priority filtering and transition selection behavior.
 
 ---
 
@@ -502,24 +521,20 @@ This approach helps you *exhaustively* understand your CPN’s behavior, includi
 
 ---
 
-## Graphical Interface
+## Graphical Interface (Streamlit visualizer)
 
-`cpnpy` provides a Streamlit-based graphical interface for editing and simulating Colored Petri Nets interactively. This interface allows you to:
+`cpnpy` includes an interactive **Streamlit** visualizer for simulating CPNs in the browser: manual step firing, batch runs (Steps/Time modes), simulation monitors, graph layout strategies, and firing animation.
 
-- **Import** an existing CPN from JSON
-- **Create** color sets from scratch
-- **Add** places, transitions, arcs, and tokens
-- **Fire** transitions or **advance** the global clock
-- **Visualize** the current marking in a Graphviz diagram
-- **Export** your CPN to JSON
+### Quick start
 
-### How to Start
+```bash
+pip install streamlit   # if not already installed
+streamlit run examples/streamlit_demo.py
+```
 
-1. **Navigate** to the root of your project directory (the directory containing the `cpnpy/` folder).
-2. **Run** the following command:
+See **[USER_GUIDE.md](USER_GUIDE.md)** for a full UI walkthrough, modeling features (priority, action blocks, record/list colorsets), and embedding `CPNStreamlitVisualizer` in your own app.
 
-   ```bash
-   streamlit run .\cpnpy\home.py
+An older Streamlit editor (`cpnpy/home.py`) may still exist for JSON-based editing; the demo above is the recommended entry point for simulation and visualization.
 
 ---
 
