@@ -1,42 +1,76 @@
         <html>
         <head>
-            <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+            <script src="./vis-network.min.js"
+                    onerror="this.onerror=null;this.src='https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js'"></script>
         <style>
                 body { margin: 0; overflow: hidden; }
+                #graph-host {
+                    position: relative;
+                    width: 100%;
+                }
                 #mynetwork {
                     width: 100%;
-                    height: 100%;
+                    min-height: 400px;
                     border: 1px solid #ddd;
                     background: #fafafa;
                 }
-                #labels-container {
-                    position: absolute; top: 0; left: 0;
+                #graph-status {
+                    position: absolute;
+                    top: 8px;
+                    left: 8px;
+                    padding: 6px 10px;
+                    background: rgba(255,255,255,0.92);
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    font: 12px Arial, sans-serif;
+                    color: #555;
+                    z-index: 50;
                     pointer-events: none;
+                }
+                #graph-error {
+                    padding: 16px;
+                    color: #b00020;
+                    font: 13px Arial, sans-serif;
+                    white-space: pre-wrap;
+                }
+                #labels-container {
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    pointer-events: none;
+                    z-index: 10;
                 }
                 .corner-label {
                     position: absolute;
-                    font: 11px Arial;
+                    font-family: Arial, sans-serif;
+                    line-height: 1.2;
                     white-space: nowrap;
                     pointer-events: none;
                 }
                 .colorset-label {
-                    font: italic 11px Arial;
+                    font-style: italic;
                     color: #555;
                 }
                 .token-label {
-                    font: bold 11px Arial;
+                    font-weight: bold;
                     color: #333;
+                    font-size: 11px;
+                }
+                .graph-scaled-label {
+                    font-family: Arial, sans-serif;
+                    line-height: 1.2;
                 }
                 .trans-ext-label {
                     position: absolute;
-                    font: 11px Arial;
                     white-space: nowrap;
                     pointer-events: none;
                     text-align: center;
                 }
                 .trans-top-label { color: black; }
                 .trans-bottom-label { color: black; }
-                .trans-bl-label { color: black; font-size: 11px; }
+                .trans-bl-label { color: black; }
                 #overlay {
                     position: absolute; top: 10px; right: 10px;
                     width: 320px; max-height: 80%;
@@ -59,62 +93,542 @@
             </style>
         </head>
         <body>
-            <div id="mynetwork"></div>
-            <div id="labels-container"></div>
+            <div id="graph-host">
+                <div id="mynetwork"></div>
+                <div id="graph-status">Loading graph…</div>
+                <div id="labels-container"></div>
+            </div>
             <div id="overlay">
                 <div class="overlay-header">
                     <span id="overlay-title">Details</span>
-                    <span class="close-btn" onclick="hideOverlay()">✖</span>
+                    <span class="close-btn" id="overlay-close-btn">✖</span>
             </div>
                 <div id="overlay-content"></div>
           </div>
 
         <script>
+                function storageKeyForGraph(nodes) {
+                    const ids = nodes.map(n => n.id).sort();
+                    const joined = ids.join("\0");
+                    let h = 2166136261;
+                    for (let i = 0; i < joined.length; i++) {
+                        h ^= joined.charCodeAt(i);
+                        h = Math.imul(h, 16777619);
+                    }
+                    return "cpn_v4_" + (h >>> 0).toString(16);
+                }
+
+                function applyPositionMap(nodes, posMap) {
+                    if (!posMap) return false;
+                    let any = false;
+                    nodes.forEach(n => {
+                        if (posMap[n.id]) {
+                            n.x = posMap[n.id].x;
+                            n.y = posMap[n.id].y;
+                            any = true;
+                        }
+                    });
+                    return any;
+                }
+
+                /** Default place half-extent when payload omits place_half_w/h. */
+                const PLACE_RADIUS = 35;
+                const TRANS_RADIUS = 25;
+                const NODE_GAP = 14;
+
+                function placeLayoutExtents(nodes) {
+                    let halfW = PLACE_RADIUS;
+                    let halfH = PLACE_RADIUS;
+                    (nodes || []).forEach(n => {
+                        if (n.type !== 'place') return;
+                        halfW = Math.max(halfW, n.place_half_w || PLACE_RADIUS);
+                        halfH = Math.max(halfH, n.place_half_h || PLACE_RADIUS);
+                    });
+                    return { halfW, halfH };
+                }
+
+                function layoutPitches(spread, placeHalfW, placeHalfH) {
+                    const s = spread || 1;
+                    const pw = placeHalfW || PLACE_RADIUS;
+                    const ph = placeHalfH || PLACE_RADIUS;
+                    const cellY = (2 * ph + NODE_GAP) * s;
+                    const cellX = (pw + TRANS_RADIUS + NODE_GAP) * s;
+                    const laneGap = (pw + TRANS_RADIUS + NODE_GAP / 2) * s;
+                    return { s, cellX, cellY, laneGap, placeHalfW: pw, placeHalfH: ph };
+                }
+
+                function placeBipartiteInLayer(nodeIds, byId, originX, baseY, pitches) {
+                    const places = nodeIds.filter(id => byId[id]?.type === 'place').sort();
+                    const trans = nodeIds.filter(id => byId[id]?.type === 'transition').sort();
+                    const other = nodeIds.filter(
+                        id => byId[id] && byId[id].type !== 'place' && byId[id].type !== 'transition',
+                    ).sort();
+                    places.forEach((id, i) => {
+                        byId[id].x = originX;
+                        byId[id].y = baseY + i * pitches.cellY;
+                    });
+                    let y = baseY + places.length * pitches.cellY + (places.length && trans.length ? pitches.laneGap : 0);
+                    trans.forEach((id, j) => {
+                        byId[id].x = originX;
+                        byId[id].y = y + j * pitches.cellY;
+                    });
+                    y += trans.length * pitches.cellY;
+                    other.forEach((id, k) => {
+                        byId[id].x = originX;
+                        byId[id].y = y + k * pitches.cellY;
+                    });
+                }
+
+                function placeNodesGrid(groupNodes, originX, originY, pitches) {
+                    const byId = {};
+                    groupNodes.forEach(n => { byId[n.id] = n; });
+                    const places = groupNodes.filter(n => n.type === 'place').map(n => n.id).sort();
+                    const trans = groupNodes.filter(n => n.type === 'transition').map(n => n.id).sort();
+                    places.forEach((id, i) => {
+                        byId[id].x = originX + (i % 3) * pitches.cellX;
+                        byId[id].y = originY + Math.floor(i / 3) * pitches.cellY;
+                    });
+                    const transY0 = originY + (Math.ceil(places.length / 3) || 0) * pitches.cellY + pitches.laneGap;
+                    trans.forEach((id, j) => {
+                        byId[id].x = originX + (j % 3) * pitches.cellX;
+                        byId[id].y = transY0 + Math.floor(j / 3) * pitches.cellY;
+                    });
+                }
+
+                /** HCPN module key; keep in sync with visualizer_st_helpers.hcpn_cluster_key. */
+                function hcpnClusterKey(id, clusterDepth) {
+                    const parts = String(id).split('.').filter(p => p);
+                    if (!parts.length) return String(id);
+                    if (clusterDepth === 1) return parts[0];
+                    if (clusterDepth != null && clusterDepth > 0) {
+                        return parts.slice(0, Math.min(clusterDepth, parts.length)).join('.');
+                    }
+                    if (parts.length <= 1) return parts[0];
+                    return parts.slice(0, -1).join('.');
+                }
+
+                function groupNodesByCluster(nodes, clusterDepth) {
+                    const groups = {};
+                    nodes.forEach(n => {
+                        if (n.x !== undefined && n.y !== undefined) return;
+                        const k = hcpnClusterKey(n.id, clusterDepth);
+                        (groups[k] ||= []).push(n);
+                    });
+                    return groups;
+                }
+
+                function nodeLayoutRadius(node) {
+                    if (node.type === 'place') {
+                        return {
+                            rx: node.place_half_w || PLACE_RADIUS,
+                            ry: node.place_half_h || PLACE_RADIUS,
+                        };
+                    }
+                    return { rx: TRANS_RADIUS, ry: TRANS_RADIUS };
+                }
+
+                function clusterBlockBounds(groupNodes) {
+                    let minX = Infinity;
+                    let minY = Infinity;
+                    let maxX = -Infinity;
+                    let maxY = -Infinity;
+                    groupNodes.forEach(n => {
+                        if (n.x === undefined || n.y === undefined) return;
+                        const { rx, ry } = nodeLayoutRadius(n);
+                        minX = Math.min(minX, n.x - rx);
+                        minY = Math.min(minY, n.y - ry);
+                        maxX = Math.max(maxX, n.x + rx);
+                        maxY = Math.max(maxY, n.y + ry);
+                    });
+                    if (!isFinite(minX)) {
+                        return { minX: 0, minY: 0, maxX: 0, maxY: 0, width: 0, height: 0 };
+                    }
+                    return {
+                        minX, minY, maxX, maxY,
+                        width: maxX - minX,
+                        height: maxY - minY,
+                    };
+                }
+
+                function translateClusterNodes(groupNodes, dx, dy) {
+                    groupNodes.forEach(n => {
+                        if (n.x !== undefined) n.x += dx;
+                        if (n.y !== undefined) n.y += dy;
+                    });
+                }
+
+                function localFlowLayers(ids, edges, idSet) {
+                    const layer = {};
+                    ids.forEach(id => { layer[id] = 0; });
+                    for (let iter = 0; iter < ids.length; iter++) {
+                        let changed = false;
+                        (edges || []).forEach(e => {
+                            if (!idSet.has(e.from) || !idSet.has(e.to)) return;
+                            const next = layer[e.from] + 1;
+                            if (next > layer[e.to]) {
+                                layer[e.to] = next;
+                                changed = true;
+                            }
+                        });
+                        if (!changed) break;
+                    }
+                    const byLayer = {};
+                    ids.forEach(id => {
+                        const L = layer[id];
+                        (byLayer[L] ||= []).push(id);
+                    });
+                    return byLayer;
+                }
+
+                function placeClusterBlock(groupNodes, edges, spread, originX, originY, useFlow) {
+                    const ext = placeLayoutExtents(groupNodes);
+                    const pitches = layoutPitches(spread, ext.halfW, ext.halfH);
+                    const byId = {};
+                    groupNodes.forEach(n => { byId[n.id] = n; });
+                    const ids = groupNodes.map(n => n.id);
+                    const idSet = new Set(ids);
+                    const localEdges = (edges || []).filter(
+                        e => idSet.has(e.from) && idSet.has(e.to),
+                    );
+                    if (useFlow) {
+                        const byLayer = localFlowLayers(ids, localEdges, idSet);
+                        const layerKeys = Object.keys(byLayer).map(Number).sort((a, b) => a - b);
+                        const MAX_FLOW_LAYERS = 12;
+                        if (layerKeys.length > MAX_FLOW_LAYERS) {
+                            placeNodesGrid(groupNodes, originX, originY, pitches);
+                        } else {
+                            const numLayers = Math.max(1, layerKeys.length);
+                            const colPitch = Math.max(
+                                pitches.cellX,
+                                Math.min(48 * pitches.s, (100 * pitches.s) / numLayers),
+                            );
+                            layerKeys.forEach(L => {
+                                placeBipartiteInLayer(
+                                    byLayer[L],
+                                    byId,
+                                    originX + L * colPitch,
+                                    originY,
+                                    pitches,
+                                );
+                            });
+                        }
+                    } else {
+                        placeNodesGrid(groupNodes, originX, originY, pitches);
+                    }
+                }
+
+                function assignClusteredLayout(nodes, edges, spread, useFlow, layoutCfg) {
+                    const cfg = layoutCfg || {};
+                    const ext = placeLayoutExtents(nodes);
+                    const pitches = layoutPitches(spread, ext.halfW, ext.halfH);
+                    const clusterDepth = cfg.module_cluster_depth != null
+                        ? cfg.module_cluster_depth : null;
+                    const groups = groupNodesByCluster(nodes, clusterDepth);
+                    const keys = Object.keys(groups).sort();
+                    if (!keys.length) return;
+
+                    const MODULE_GAP = 24;
+                    const MAX_PACK_COLS_LARGE_FLOW = 4;
+                    const gap = MODULE_GAP * pitches.s;
+                    let cols = Math.max(1, Math.ceil(Math.sqrt(keys.length)));
+                    if (useFlow && cfg.large && cfg.strategy === 'flow_lr') {
+                        cols = Math.min(cols, MAX_PACK_COLS_LARGE_FLOW);
+                    }
+                    if (useFlow && cfg.large && cfg.strategy === 'layered_lr') {
+                        cols = 1;
+                    }
+
+                    const packed = keys.map(key => {
+                        const groupNodes = groups[key];
+                        placeClusterBlock(groupNodes, edges, spread, 0, 0, useFlow);
+                        const bounds = clusterBlockBounds(groupNodes);
+                        return { groupNodes, bounds };
+                    });
+
+                    let cursorX = 0;
+                    let cursorY = 0;
+                    let rowHeight = 0;
+                    let colIndex = 0;
+                    packed.forEach(({ groupNodes, bounds }) => {
+                        if (colIndex >= cols && colIndex > 0) {
+                            cursorX = 0;
+                            cursorY += rowHeight + gap;
+                            rowHeight = 0;
+                            colIndex = 0;
+                        }
+                        translateClusterNodes(
+                            groupNodes,
+                            cursorX - bounds.minX,
+                            cursorY - bounds.minY,
+                        );
+                        cursorX += bounds.width + gap;
+                        rowHeight = Math.max(rowHeight, bounds.height);
+                        colIndex += 1;
+                    });
+                }
+
+                function assignFlowLRPositions(nodes, edges, spread, layoutCfg) {
+                    assignClusteredLayout(nodes, edges, spread, true, layoutCfg);
+                }
+
+                function assignClusterPositions(nodes, edges, spread, layoutCfg) {
+                    assignClusteredLayout(nodes, edges, spread, false, layoutCfg);
+                }
+
+                function placeNodesInOrder(nodeIds, byId, originX, baseY, pitches) {
+                    nodeIds.forEach((id, i) => {
+                        if (!byId[id]) return;
+                        byId[id].x = originX;
+                        byId[id].y = baseY + i * pitches.cellY;
+                    });
+                }
+
+                function barycenterOrder(layerIds, edges, idSet, coordById) {
+                    const scored = layerIds.map(id => {
+                        let sum = 0;
+                        let count = 0;
+                        (edges || []).forEach(e => {
+                            let other;
+                            if (e.from === id && idSet.has(e.to)) other = e.to;
+                            else if (e.to === id && idSet.has(e.from)) other = e.from;
+                            else return;
+                            if (coordById[other] !== undefined) {
+                                sum += coordById[other];
+                                count += 1;
+                            }
+                        });
+                        return { id, score: count ? sum / count : 0 };
+                    });
+                    scored.sort((a, b) => a.score - b.score || String(a.id).localeCompare(String(b.id)));
+                    return scored.map(s => s.id);
+                }
+
+                /**
+                 * Layered LR: small nets = whole-graph flow layers + barycenter ordering.
+                 * Large nets = per-module flow (like Flow LR), modules in one horizontal strip.
+                 */
+                function assignLayeredLRPositions(nodes, edges, spread, layoutCfg) {
+                    const cfg = layoutCfg || {};
+                    if (cfg.large) {
+                        assignClusteredLayout(nodes, edges, spread, true, {
+                            ...cfg,
+                            strategy: 'layered_lr',
+                        });
+                        return;
+                    }
+                    const ext = placeLayoutExtents(nodes);
+                    const pitches = layoutPitches(spread, ext.halfW, ext.halfH);
+                    const byId = {};
+                    nodes.forEach(n => { byId[n.id] = n; });
+                    const ids = nodes.map(n => n.id);
+                    const idSet = new Set(ids);
+                    const localEdges = (edges || []).filter(
+                        e => idSet.has(e.from) && idSet.has(e.to),
+                    );
+                    const byLayer = localFlowLayers(ids, localEdges, idSet);
+                    const layerKeys = Object.keys(byLayer).map(Number).sort((a, b) => a - b);
+                    const MAX_FLOW_LAYERS = 12;
+                    if (layerKeys.length > MAX_FLOW_LAYERS) {
+                        placeNodesGrid(nodes, 0, 0, pitches);
+                        return;
+                    }
+                    const numLayers = Math.max(1, layerKeys.length);
+                    const colPitch = Math.max(
+                        pitches.cellX,
+                        Math.min(48 * pitches.s, (100 * pitches.s) / numLayers),
+                    );
+                    const yCoord = {};
+                    for (let sweep = 0; sweep < 4; sweep++) {
+                        const keys = sweep % 2 === 0
+                            ? layerKeys
+                            : layerKeys.slice().reverse();
+                        keys.forEach(L => {
+                            const ordered = barycenterOrder(byLayer[L], edges, idSet, yCoord);
+                            byLayer[L] = ordered;
+                            ordered.forEach((id, i) => { yCoord[id] = i; });
+                        });
+                    }
+                    layerKeys.forEach(L => {
+                        placeNodesInOrder(byLayer[L], byId, L * colPitch, 0, pitches);
+                    });
+                }
+
+                function assignInitialPositions(nodes, spread) {
+                    const ext = placeLayoutExtents(nodes);
+                    const pitches = layoutPitches(spread, ext.halfW, ext.halfH);
+                    const groups = {};
+                    nodes.forEach(n => {
+                        if (n.x !== undefined || n.y !== undefined) return;
+                        const prefix = hcpnClusterKey(n.id);
+                        (groups[prefix] ||= []).push(n);
+                    });
+                    const prefixes = Object.keys(groups).sort();
+                    const cols = Math.max(1, Math.ceil(Math.sqrt(prefixes.length)));
+                    const blockW = 3 * pitches.cellX + 40 * pitches.s;
+                    const blockH = 3 * pitches.cellY + 80 * pitches.s;
+                    prefixes.forEach((prefix, gi) => {
+                        const col = gi % cols;
+                        const row = Math.floor(gi / cols);
+                        placeNodesGrid(
+                            groups[prefix],
+                            col * blockW,
+                            row * blockH,
+                            pitches,
+                        );
+                    });
+                }
+
+                function showGraphError(container, message) {
+                    container.innerHTML = '<div id="graph-error">' + message + '</div>';
+                    const status = document.getElementById('graph-status');
+                    if (status) status.style.display = 'none';
+                }
+
                 function runGraph(graphData, height) {
                 const anim = graphData.animation || {};
                 const TOKEN_DURATION = anim.phase_ms || 200;
                 const PHASE_GAP = anim.gap_ms || 25;
                 const TOKEN_STAGGER = anim.stagger_ms || 20;
+                const graphHost = document.getElementById('graph-host');
                 const container = document.getElementById('mynetwork');
                 const labelsContainer = document.getElementById('labels-container');
+                const statusEl = document.getElementById('graph-status');
                 container.innerHTML = '';
                 labelsContainer.innerHTML = '';
+                if (statusEl) {
+                    statusEl.style.display = 'block';
+                    statusEl.textContent = 'Loading graph…';
+                }
                 container.style.height = (height || 800) + 'px';
-                const STORAGE_KEY = "cpn_v1_" + btoa(graphData.nodes.map(n => n.id).join(",")).slice(0, 16);
+
+                if (typeof vis === 'undefined') {
+                    showGraphError(container, 'vis-network failed to load. Check network access or reinstall cpnpy.');
+                    return;
+                }
+
+                const STORAGE_KEY = storageKeyForGraph(graphData.nodes);
                 const VIEW_KEY = STORAGE_KEY + "_v";
                 const SEL_KEY  = STORAGE_KEY + "_s";
 
-                const savedPos = localStorage.getItem(STORAGE_KEY);
-                if (savedPos) {
-                    try {
-                        const posMap = JSON.parse(savedPos);
-                        graphData.nodes.forEach(n => {
-                            if (posMap[n.id]) { n.x = posMap[n.id].x; n.y = posMap[n.id].y; }
-                        });
-                    } catch (e) {}
+                if (graphData.clear_saved_layout) {
+                    localStorage.removeItem(STORAGE_KEY);
+                    localStorage.removeItem(VIEW_KEY);
+                    localStorage.removeItem(SEL_KEY);
                 }
 
+                const layoutCfg = graphData.layout || {};
+                const nodeCount = graphData.nodes.length;
+                const stabilizationIterations = layoutCfg.stabilization_iterations
+                    || Math.min(2000, Math.max(300, nodeCount * 10));
+                const layoutStrategy = layoutCfg.strategy || 'force';
+                const fitOnStabilized = layoutCfg.fit_on_stabilized !== false;
+                const fitInViewRequested = graphData.fit_in_view === true;
+                const layoutSpread = layoutCfg.spread_factor || 1.25;
+
+                let statusHidden = false;
+                const statusFallbackTimer = setTimeout(() => hideGraphStatus(), 5000);
+                function hideGraphStatus() {
+                    if (statusHidden || !statusEl) return;
+                    statusHidden = true;
+                    clearTimeout(statusFallbackTimer);
+                    statusEl.style.display = 'none';
+                }
+
+                let loadedFromSave = false;
+                const sessionPositions = graphData.saved_layout && graphData.saved_layout.positions;
+                if (!graphData.clear_saved_layout) {
+                    if (graphData.prefer_saved_layout && sessionPositions) {
+                        loadedFromSave = applyPositionMap(graphData.nodes, sessionPositions);
+                    } else {
+                        const lsRaw = localStorage.getItem(STORAGE_KEY);
+                        if (lsRaw) {
+                            try {
+                                loadedFromSave = applyPositionMap(
+                                    graphData.nodes, JSON.parse(lsRaw),
+                                );
+                            } catch (e) {}
+                        }
+                        if (!loadedFromSave && sessionPositions) {
+                            loadedFromSave = applyPositionMap(graphData.nodes, sessionPositions);
+                        }
+                    }
+                }
+                if (!loadedFromSave) {
+                    if (layoutStrategy === 'flow_lr') {
+                        assignFlowLRPositions(graphData.nodes, graphData.edges, layoutSpread, layoutCfg);
+                    } else if (layoutStrategy === 'cluster') {
+                        assignClusterPositions(graphData.nodes, graphData.edges, layoutSpread, layoutCfg);
+                    } else if (layoutStrategy === 'layered_lr') {
+                        assignLayeredLRPositions(
+                            graphData.nodes, graphData.edges, layoutSpread, layoutCfg,
+                        );
+                    } else {
+                        assignInitialPositions(graphData.nodes, layoutSpread);
+                    }
+                }
+
+                const usePhysics = !loadedFromSave && layoutStrategy === 'force';
+                const layoutFitAfterDraw = !loadedFromSave && layoutStrategy !== 'force';
+                if (!usePhysics) hideGraphStatus();
+
+                const placeExt = placeLayoutExtents(graphData.nodes);
+                const minPhysDist = (placeExt.halfW + TRANS_RADIUS + NODE_GAP) * layoutSpread;
                 const options = {
-                    nodes: { font: { face: 'Arial' }, margin: 10 },
+                    nodes: {
+                        font: { face: 'Arial', multi: 'html' },
+                        margin: 16,
+                        fixed: false,
+                        scaling: { label: { enabled: false } },
+                    },
                     edges: {
                         smooth: false,
                         color: { inherit: 'from' },
-                        arrows: { to: { enabled: true } }
+                        arrows: { to: { enabled: true } },
+                        font: { size: 11, align: 'top' },
                     },
                     physics: {
-                        enabled: !savedPos,
+                        enabled: usePhysics,
                         solver: 'forceAtlas2Based',
                         forceAtlas2Based: {
-                            gravitationalConstant: -100,
-                            centralGravity: 0.01,
-                            springLength: 100,
-                            springConstant: 0.08,
-                            nodeDistance: 180
+                            gravitationalConstant: -80 * layoutSpread,
+                            centralGravity: 0.02,
+                            springLength: Math.max(85, 95 * layoutSpread),
+                            springConstant: 0.09,
+                            nodeDistance: Math.max(minPhysDist, 120 * layoutSpread),
+                            damping: 0.5,
                         },
-                        stabilization: { iterations: 200 }
+                        stabilization: {
+                            iterations: stabilizationIterations,
+                            fit: fitOnStabilized,
+                        }
                     },
-                    interaction: { hover: true, navigationButtons: false, keyboard: true }
+                    interaction: {
+                        hover: true,
+                        navigationButtons: false,
+                        keyboard: true,
+                        dragNodes: true,
+                        dragView: true,
+                        zoomView: true,
+                    }
                 };
+
+                function syncLayoutToStreamlit() {
+                    try {
+                        window.parent.postMessage({
+                            isStreamlitMessage: true,
+                            type: "streamlit:setComponentValue",
+                            value: JSON.stringify({
+                                type: "layout",
+                                positions: network.getPositions(),
+                                view: {
+                                    pos: network.getViewPosition(),
+                                    scale: network.getScale(),
+                                },
+                            }),
+                            dataType: "json",
+                        }, "*");
+                    } catch (e) {}
+                }
 
                 function saveState() {
                     localStorage.setItem(STORAGE_KEY, JSON.stringify(network.getPositions()));
@@ -124,22 +638,93 @@
                     }));
                 }
 
+                function nodesHaveValidBounds() {
+                    try {
+                        const ids = graphData.nodes.map(n => n.id);
+                        const bb = network.getBoundingBox(ids);
+                        return bb && isFinite(bb.left) && (bb.right - bb.left) > 30;
+                    } catch (e) {
+                        return false;
+                    }
+                }
+
+                function applyFitInView() {
+                    let fitViewPersisted = false;
+                    const persistFitView = () => {
+                        if (fitViewPersisted) return;
+                        fitViewPersisted = true;
+                        saveState();
+                        syncLayoutToStreamlit();
+                        updateCornerLabels();
+                    };
+                    network.once('animationFinished', persistFitView);
+                    setTimeout(persistFitView, 500);
+                    network.fit({
+                        animation: { duration: 300 },
+                        padding: 60,
+                        minZoomLevel: 0.05,
+                        maxZoomLevel: 1.2,
+                    });
+                }
+
+                function scheduleFitInView() {
+                    if (!fitInViewRequested) return;
+                    const fitToken = graphData.fit_in_view_token || 0;
+                    if (fitToken <= (window.__cpnLastFitToken || -1)) return;
+                    window.__cpnLastFitToken = fitToken;
+                    const runViewportFit = () => {
+                        let attempts = 0;
+                        const tryFit = () => {
+                            attempts += 1;
+                            if (nodesHaveValidBounds() || attempts >= 25) {
+                                applyFitInView();
+                                return;
+                            }
+                            setTimeout(tryFit, 50);
+                        };
+                        tryFit();
+                    };
+                    if (options.physics.enabled) {
+                        network.once('stabilized', runViewportFit);
+                    } else {
+                        setTimeout(runViewportFit, 0);
+                    }
+                }
+
                 const nodesDS = new vis.DataSet(graphData.nodes);
                 const edgesDS = new vis.DataSet(graphData.edges);
                 const network = new vis.Network(container, { nodes: nodesDS, edges: edgesDS }, options);
 
-                network.on("dragEnd", saveState);
-                network.on("zoom", saveState);
-                network.once("afterDrawing", () => {
-                    if (!localStorage.getItem(STORAGE_KEY)) saveState();
+                network.on("dragEnd", () => {
+                    saveState();
+                    syncLayoutToStreamlit();
+                    updateCornerLabels();
                 });
+                network.on("zoom", () => {
+                    saveState();
+                    updateCornerLabels();
+                });
+                network.on("dragging", updateCornerLabels);
+                network.once("afterDrawing", () => {
+                    hideGraphStatus();
+                    if (graphData.prefer_saved_layout && loadedFromSave) {
+                        saveState();
+                    } else if (!loadedFromSave && !localStorage.getItem(STORAGE_KEY)) {
+                        saveState();
+                    }
+                });
+                if (layoutFitAfterDraw) {
+                    network.once("afterDrawing", () => {
+                        network.fit({ animation: false, padding: 50 });
+                    });
+                }
 
-                const savedView = localStorage.getItem(VIEW_KEY);
-                if (savedView) {
-                    try {
-                        const v = JSON.parse(savedView);
-                        network.moveTo({ position: v.pos, scale: v.scale, animation: false });
-                    } catch (e) {}
+                let savedView = null;
+                if (!graphData.clear_saved_layout && !fitInViewRequested) {
+                    savedView = localStorage.getItem(VIEW_KEY);
+                    if (!savedView && graphData.saved_layout && graphData.saved_layout.view) {
+                        savedView = JSON.stringify(graphData.saved_layout.view);
+                    }
                 }
 
                 const placeNodes = graphData.nodes.filter(n => n.type === 'place');
@@ -148,7 +733,7 @@
                 const transLabelEls = {};
                 placeNodes.forEach(node => {
                     const tr = document.createElement('div');
-                    tr.className = 'corner-label colorset-label';
+                    tr.className = 'corner-label colorset-label graph-scaled-label';
                     tr.innerText = node.corner_tr || '';
                     labelsContainer.appendChild(tr);
                     const br = document.createElement('div');
@@ -171,21 +756,27 @@
 
                 transNodes.forEach(node => {
                     const top = document.createElement('div');
-                    top.className = 'trans-ext-label trans-top-label';
+                    top.className = 'trans-ext-label trans-top-label graph-scaled-label';
                     top.innerText = node.external_top || '';
                     labelsContainer.appendChild(top);
                     const bottom = document.createElement('div');
-                    bottom.className = 'trans-ext-label trans-bottom-label';
+                    bottom.className = 'trans-ext-label trans-bottom-label graph-scaled-label';
                     bottom.innerText = node.external_bottom || '';
                     labelsContainer.appendChild(bottom);
                     const bl = document.createElement('div');
-                    bl.className = 'trans-ext-label trans-bl-label';
+                    bl.className = 'trans-ext-label trans-bl-label graph-scaled-label';
                     bl.innerText = node.external_bl || '';
                     labelsContainer.appendChild(bl);
                     transLabelEls[node.id] = { top, bottom, bl };
                 });
 
+                const GRAPH_ANNOTATION_FONT_PX = 11;
+                const PLACE_TOKEN_FONT_PX = 11;
+
                 function updateCornerLabels() {
+                    const viewScale = network.getScale();
+                    const graphFontPx = GRAPH_ANNOTATION_FONT_PX * viewScale;
+                    const tokenFontPx = PLACE_TOKEN_FONT_PX;
                     placeNodes.forEach(node => {
                         const els = labelEls[node.id];
                         if (!els) return;
@@ -194,8 +785,10 @@
                             const rDom = network.canvasToDOM({x: box.right, y: 0}).x;
                             const tDom = network.canvasToDOM({x: 0, y: box.top}).y;
                             const bDom = network.canvasToDOM({x: 0, y: box.bottom}).y;
+                            els.tr.style.fontSize = graphFontPx + 'px';
+                            els.br.style.fontSize = tokenFontPx + 'px';
                             els.tr.style.left = (rDom + 2) + 'px';
-                            els.tr.style.top  = (tDom - 5) + 'px';
+                            els.tr.style.top  = (tDom - 5 * viewScale) + 'px';
                             els.br.style.left = (rDom + 2) + 'px';
                             els.br.style.top  = (bDom - 10) + 'px';
                         } catch(e) {}
@@ -208,26 +801,61 @@
                             const tDom = network.canvasToDOM({x: 0, y: box.top}).y;
                             const bDom = network.canvasToDOM({x: 0, y: box.bottom}).y;
                             const hMid = network.canvasToDOM({x: (box.left + box.right)/2, y: 0}).x;
+                            els.top.style.fontSize = graphFontPx + 'px';
+                            els.bottom.style.fontSize = graphFontPx + 'px';
+                            els.bl.style.fontSize = graphFontPx + 'px';
                             els.top.style.left = hMid + 'px';
-                            els.top.style.top  = (tDom - 15) + 'px';
+                            els.top.style.top  = (tDom - 15 * viewScale) + 'px';
                             els.top.style.transform = 'translateX(-50%)';
                             els.bottom.style.left = hMid + 'px';
-                            els.bottom.style.top  = (bDom + 1) + 'px';
+                            els.bottom.style.top  = (bDom + 1 * viewScale) + 'px';
                             els.bottom.style.transform = 'translateX(-50%)';
                             const lDom = network.canvasToDOM({x: box.left, y: 0}).x;
-                            els.bl.style.left = (lDom - 4) + 'px';
-                            els.bl.style.top  = (bDom - 12) + 'px';
+                            els.bl.style.left = (lDom - 4 * viewScale) + 'px';
+                            els.bl.style.top  = (bDom - 12 * viewScale) + 'px';
                             els.bl.style.transform = 'translateX(-100%)';
                         } catch(e) {}
                     });
                 }
 
+                if (savedView) {
+                    try {
+                        const v = JSON.parse(savedView);
+                        network.moveTo({ position: v.pos, scale: v.scale, animation: false });
+                    } catch (e) {}
+                }
+                updateCornerLabels();
+
+                network.on("stabilizationProgress", params => {
+                    if (statusEl && params.total > 0) {
+                        statusEl.textContent = 'Layout ' + Math.round(100 * params.iterations / params.total) + '%…';
+                    }
+                });
+
                 network.on("stabilized", () => {
-                    saveState();
+                    if (!loadedFromSave) saveState();
                     network.setOptions({ physics: { enabled: false } });
+                    if (!fitInViewRequested && fitOnStabilized && !localStorage.getItem(VIEW_KEY)) {
+                        network.fit({
+                            animation: { duration: 250 },
+                            padding: 60,
+                            minZoomLevel: 0.05,
+                            maxZoomLevel: 1.2,
+                        });
+                    }
+                    hideGraphStatus();
                     updateCornerLabels();
                 });
-                network.on('afterDrawing', updateCornerLabels);
+                network.on('afterDrawing', () => {
+                    hideGraphStatus();
+                    updateCornerLabels();
+                });
+
+                if (!options.physics.enabled) {
+                    hideGraphStatus();
+                }
+
+                scheduleFitInView();
 
                 const inArcs = graphData.animate_in || [];
                 const outArcs = graphData.animate_out || [];
@@ -247,10 +875,18 @@
                     } catch (e) {}
                 }
 
+                function arcDrawCount(entry) {
+                    if (entry.draw_count != null) {
+                        return Math.max(1, entry.draw_count);
+                    }
+                    const c = Math.max(1, entry.count || 1);
+                    return c > 5 ? 1 : Math.min(c, 5);
+                }
+
                 function phaseDuration(arcs, phaseStart) {
                     let end = phaseStart;
                     arcs.forEach(entry => {
-                        const c = Math.max(1, entry.count || 1);
+                        const c = arcDrawCount(entry);
                         end = Math.max(end, phaseStart + TOKEN_DURATION + (c - 1) * TOKEN_STAGGER);
                     });
                     return end;
@@ -283,16 +919,18 @@
 
                 function drawArcTokens(ctx, arcs, phaseStart, elapsed) {
                     arcs.forEach(entry => {
-                        const count = Math.max(1, entry.count || 1);
+                        const drawCount = arcDrawCount(entry);
+                        const badge = entry.badge_count;
                         const [fromId, toId] = entry.arc.split('|');
                         let sPos, ePos;
                         try {
                             sPos = network.canvasToDOM(network.getPosition(fromId));
                             ePos = network.canvasToDOM(network.getPosition(toId));
                         } catch(e) { return; }
-                        const edge = edgesDS.get(entry.arc);
+                        const edge = edgesDS.get(entry.arc)
+                            || graphData.edges.find(e => e.from === fromId && e.to === toId);
                         const isCurved = edge && edge.is_curved;
-                        for (let i = 0; i < count; i++) {
+                        for (let i = 0; i < drawCount; i++) {
                             const local = elapsed - phaseStart - i * TOKEN_STAGGER;
                             if (local < 0 || local >= TOKEN_DURATION) continue;
                             const t = local / TOKEN_DURATION;
@@ -304,17 +942,22 @@
                             ctx.strokeStyle = 'white';
                             ctx.lineWidth = 2;
                             ctx.stroke();
+                            if (badge && i === 0) {
+                                ctx.font = 'bold 12px Arial';
+                                ctx.fillStyle = '#1e8449';
+                                ctx.fillText('\u00d7' + badge, x + 10, y - 5);
+                            }
                         }
                     });
                 }
 
                 if (inArcs.length > 0 || outArcs.length > 0) {
-                    container.style.position = 'relative';
+                    const animParent = graphHost || container;
                     const canvas = document.createElement('canvas');
                     canvas.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;width:100%;height:100%;z-index:99;';
-                    container.appendChild(canvas);
+                    animParent.appendChild(canvas);
                     const resize = () => {
-                        const r = container.getBoundingClientRect();
+                        const r = animParent.getBoundingClientRect();
                         canvas.width = r.width;
                         canvas.height = r.height;
                     };
@@ -333,7 +976,7 @@
                         } else {
                             revertAnimatingTransition();
                             window.removeEventListener('resize', resize);
-                            setTimeout(() => { if (canvas.parentNode) container.removeChild(canvas); }, 50);
+                            setTimeout(() => { if (canvas.parentNode) animParent.removeChild(canvas); }, 50);
                         }
                     };
                     requestAnimationFrame(animFrame);
@@ -368,10 +1011,17 @@
                     }
                 });
 
-                const lastSel = localStorage.getItem(SEL_KEY);
-                if (lastSel) {
-                    const node = graphData.nodes.find(n => n.id === lastSel);
-                    if (node) showOverlay(node);
+                const closeBtn = document.getElementById('overlay-close-btn');
+                if (closeBtn) {
+                    closeBtn.onclick = hideOverlay;
+                }
+
+                if (!fitInViewRequested) {
+                    const lastSel = localStorage.getItem(SEL_KEY);
+                    if (lastSel) {
+                        const node = graphData.nodes.find(n => n.id === lastSel);
+                        if (node) showOverlay(node);
+                    }
                 }
 
                 function showOverlay(node) {
@@ -416,9 +1066,11 @@
                 }
 
                 function hideOverlay() {
-                    document.getElementById('overlay').style.display = 'none';
+                    const overlay = document.getElementById('overlay');
+                    if (overlay) overlay.style.display = 'none';
                     localStorage.removeItem(SEL_KEY);
                 }
+                window.hideOverlay = hideOverlay;
 
                 function esc(text) {
                     const d = document.createElement('div');
@@ -429,11 +1081,17 @@
                 window.addEventListener("message", function (event) {
                     if (!event.data || event.data.type !== "streamlit:render") return;
                     const args = event.data.args || {};
-                    runGraph(JSON.parse(args.graph_data_json), args.height || 800);
+                    const frameHeight = args.height || 800;
+                    try {
+                        runGraph(JSON.parse(args.graph_data_json), frameHeight);
+                    } catch (err) {
+                        const container = document.getElementById('mynetwork');
+                        showGraphError(container, 'Graph render failed: ' + (err && err.message ? err.message : err));
+                    }
                     window.parent.postMessage({
                         isStreamlitMessage: true,
                         type: "streamlit:setFrameHeight",
-                        height: args.height || 800,
+                        height: frameHeight,
                     }, "*");
                 });
                 window.parent.postMessage({

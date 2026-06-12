@@ -187,26 +187,56 @@ class Marking:
 class EvaluationContext:
     def __init__(self, user_code: Optional[Union[str, ModuleType]] = None):
         self.env = {}
+        self._guard_errors: Dict[str, str] = {}
         if user_code is not None:
-            if isinstance(user_code, str):
-                exec(user_code, self.env)
-            elif isinstance(user_code, ModuleType):
-                self.env.update(user_code.__dict__)
+            try:
+                if isinstance(user_code, str):
+                    exec(user_code, self.env)
+                elif isinstance(user_code, ModuleType):
+                    self.env.update(user_code.__dict__)
+                else:
+                    raise TypeError(
+                        f"user_code must be str or ModuleType, got {type(user_code).__name__}"
+                    )
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to load evaluation context user code: {type(e).__name__}: {e}"
+                ) from e
+
+    def clear_guard_errors(self) -> None:
+        self._guard_errors.clear()
+
+    def record_guard_error(self, transition_name: str, exc: BaseException) -> None:
+        self._guard_errors[transition_name] = f"{type(exc).__name__}: {exc}"
+
+    @property
+    def guard_error_names(self) -> list[str]:
+        return list(self._guard_errors.keys())
+
+    @property
+    def guard_errors(self) -> Dict[str, str]:
+        return dict(self._guard_errors)
+
+    def _binding_namespace(self, binding: Dict[str, Any]) -> Dict[str, Any]:
+        """Merged globals/locals for eval — required for genexpr/comprehension scope in Py3."""
+        return {**self.env, **binding}
 
     def evaluate_guard(self, guard_expr: Optional[str], binding: Dict[str, Any]) -> bool:
         if guard_expr is None:
             return True
-        return bool(eval(guard_expr, self.env, binding))
+        namespace = self._binding_namespace(binding)
+        return bool(eval(guard_expr, namespace, namespace))
 
     def _parse_expr_and_delay(self, arc_expr: str, binding: Dict[str, Any]) -> (str, int):
         delay = 0
         expr_part = arc_expr
+        namespace = self._binding_namespace(binding)
         if "@+" in arc_expr:
             parts = arc_expr.split('@+')
             expr_part = parts[0].strip()
             delay_part = parts[1].strip()
             # Delay is usually a simple expression or number
-            delay = eval(delay_part, self.env, binding)
+            delay = eval(delay_part, namespace, namespace)
         return expr_part, delay
 
     def evaluate_input_arc(self, arc_expr: str, binding: Dict[str, Any]) -> (List[Any], int):
@@ -229,7 +259,8 @@ class EvaluationContext:
     def evaluate_output_arc(self, arc_expr: str, binding: Dict[str, Any], 
                             target_cs: Optional[ColorSet] = None) -> (List[Any], int):
         expr_part, delay = self._parse_expr_and_delay(arc_expr, binding)
-        val = eval(expr_part, self.env, binding)
+        namespace = self._binding_namespace(binding)
+        val = eval(expr_part, namespace, namespace)
 
         if target_cs and target_cs.is_member(val):
             return [val], delay
@@ -453,7 +484,10 @@ class CPN:
             for v in values:
                 place = arc.target
                 if not place.colorset.is_member(v):
-                    raise Exception(f"Token value {v} is not a member of colorset {place.colorset} for place {place.name}")
+                    raise ValueError(
+                        f"Token value {v!r} is not a member of colorset {place.colorset} "
+                        f"for place {place.name}"
+                    )
                 
                 new_timestamp = marking.global_clock + t.transition_delay + arc_delay
                 final_ts = new_timestamp if place.colorset.timed else 0
@@ -483,7 +517,11 @@ class CPN:
     def _check_enabled_with_binding(self, t: Transition, marking: Marking, context: EvaluationContext,
                                     binding: Dict[str, Any]) -> bool:
         if t.guard_expr:
-            if not context.evaluate_guard(t.guard_expr, binding):
+            try:
+                if not context.evaluate_guard(t.guard_expr, binding):
+                    return False
+            except Exception as exc:
+                context.record_guard_error(t.name, exc)
                 return False
         # Check input arcs and timestamps
         for arc in self.get_input_arcs(t):

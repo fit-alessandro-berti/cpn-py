@@ -15,10 +15,14 @@ def get_enabled_transitions(
     Get all transitions currently enabled at the marking's global_clock.
     If only_best_priority=True (default), only return transitions with the highest priority (lowest numeric value).
     """
-    enabled = [
-        t for t in cpn.transitions
-        if cpn.is_enabled(t, marking, context)
-    ]
+    context.clear_guard_errors()
+    enabled = []
+    for t in cpn.transitions:
+        try:
+            if cpn.is_enabled(t, marking, context):
+                enabled.append(t)
+        except Exception as exc:
+            context.record_guard_error(t.name, exc)
 
     if not enabled or not only_best_priority:
         return enabled

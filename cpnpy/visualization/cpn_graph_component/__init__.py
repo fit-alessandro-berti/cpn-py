@@ -22,8 +22,12 @@ def cpn_graph(
     key: str | None = None,
 ) -> str | None:
     """
-    Render the CPN graph. Returns a transition name when the user clicks an
-    enabled (green) transition in Step sync mode, otherwise None.
+    Render the CPN graph.
+
+    Return value:
+    - Transition name (str) when the user clicks an enabled transition in Step sync mode.
+    - JSON string ``{"type": "layout", "positions": {...}, "view": {...}}`` when the
+      iframe syncs manual layout (drag end or fit-in-view); otherwise None.
     """
     value = _cpn_graph(
         graph_data_json=json.dumps(graph_data),

@@ -1,9 +1,12 @@
+import traceback
+
 import streamlit as st
 from cpnpy.cpn.cpn_imp import (
     CPN, Place, Transition, Arc, Marking, EvaluationContext,
     ColorSetParser,
 )
 from cpnpy.visualization.visualizer_st import CPNStreamlitVisualizer
+from cpnpy.visualization.visualizer_st_helpers import format_simulation_error
 
 
 def build_cpn():
@@ -149,7 +152,13 @@ def main():
     st.title("CPN-py Interactive Visualizer")
 
     if "cpn_built" not in st.session_state:
-        cpn, marking, context = build_cpn()
+        try:
+            cpn, marking, context = build_cpn()
+        except Exception as e:
+            st.error(f"Failed to build demo CPN — {format_simulation_error(e)}")
+            with st.expander("Error details", expanded=False):
+                st.code(traceback.format_exc(), language="text")
+            st.stop()
         st.session_state["demo_cpn"]     = cpn
         st.session_state["demo_marking"] = marking
         st.session_state["demo_context"] = context
@@ -163,6 +172,17 @@ def main():
         st.session_state["demo_marking"],
         context=context,
         session_key="demo_marking",
+    )
+    viz.register_monitor(
+        "T_Increment enabled",
+        lambda cpn, marking: True,
+        before=True,
+        transition_name="T_Increment",
+    )
+    viz.register_monitor(
+        "Clock >= 5",
+        lambda cpn, marking: marking.global_clock >= 5,
+        before=True,
     )
     viz.render(height=800)
 

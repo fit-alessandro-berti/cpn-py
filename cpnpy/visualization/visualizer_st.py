@@ -1,5 +1,7 @@
 import copy
+import json
 import time
+import traceback
 from typing import Callable
 
 import streamlit as st
@@ -10,18 +12,57 @@ from cpnpy.visualization.cpn_graph_component import cpn_graph
 from cpnpy.visualization.visualizer_st_helpers import (
     ANIMATION_START_BUFFER_MS,
     BATCH_TERMINAL,
+    DEFAULT_LAYOUT_STRATEGY,
+    DEFAULT_SPACING_PCT,
     DEFAULT_TRANSITION_ANIMATION_MS,
+    FAST_BATCH_ADVANCES_PER_RUN,
     FAST_BATCH_MAX_ITERATIONS,
     MAX_ADVANCES_PER_RUN,
+    MAX_SPACING_PCT,
     MAX_TRANSITION_ANIMATION_MS,
+    MIN_SPACING_PCT,
     MIN_TRANSITION_ANIMATION_MS,
+    MonitorSpec,
     STOP_POLL_MS,
     animation_wait_ms,
     batch_status_level,
     batch_step_logic,
     compute_animation_timings,
+    compute_graph_layout,
+    enabled_transition_names,
+    evaluate_monitors,
+    arc_edge_id,
+    format_simulation_error,
+    format_simulation_metrics_row,
     get_action_source,
+    estimate_place_ellipse_size,
+    format_place_graph_label,
+    format_transition_graph_label,
+    format_guard_external_label,
+    GUARD_EXTERNAL_MAX_LEN,
+    GUARD_EXTERNAL_MAX_LEN_LARGE,
+    monitor_batch_status_message,
+    normalize_animation_arcs,
+    PLACE_LABEL_FONT_SIZE_PX,
+    raise_if_invalid_net,
+    apply_imported_positions,
+    apply_status_dismiss,
+    build_layout_file_payload,
+    clear_status_dismiss,
+    graph_layout_storage_key,
+    is_status_dismissed,
+    parse_layout_file_json,
+    slugify_monitor_name,
 )
+
+_LAYOUT_STRATEGY_LABELS = ("Force", "Flow LR", "Cluster", "Layered LR")
+_LAYOUT_STRATEGY_BY_LABEL = {
+    "Force": "force",
+    "Flow LR": "flow_lr",
+    "Cluster": "cluster",
+    "Layered LR": "layered_lr",
+}
+_LAYOUT_LABEL_BY_STRATEGY = {v: k for k, v in _LAYOUT_STRATEGY_BY_LABEL.items()}
 
 
 class CPNStreamlitVisualizer:
@@ -32,8 +73,22 @@ class CPNStreamlitVisualizer:
     - Places and transitions with external labels; click for detail overlay.
     - Simulation step counter and configurable animation duration (default 500 ms).
     - Manual fire or batch simulation (Steps / Time modes, optional animation).
-    - Two-phase firing animation: input arcs, then output arcs.
-    - Physics disabled after layout; positions persist in localStorage.
+    - Simulation monitors via ``register_monitor`` (pause when a predicate matches).
+
+    Example (svm_dvrp-style)::
+
+        viz.register_monitor(
+            "Drive enabled",
+            lambda cpn, marking: True,
+            before=True,
+            transition_name="execute_route.Drive",
+        )
+        viz.register_monitor(
+            "WriteMetrics enabled",
+            lambda cpn, marking: True,
+            before=True,
+            transition_name="scheduler.WriteMetrics",
+        )
 
     Batch state machine (batch_phase):
       idle    — no batch running
@@ -42,9 +97,18 @@ class CPNStreamlitVisualizer:
       show    — display firing animation, then return to advance
     """
 
+    _STATUS_LEVEL_ORDER = ("error", "warning", "success", "info")
+    _STATUS_WIDGETS = {
+        "error": st.error,
+        "warning": st.warning,
+        "success": st.success,
+        "info": st.info,
+    }
+
     def __init__(self, cpn: CPN, marking: Marking,
                  context: EvaluationContext | None = None,
                  session_key: str = "cpn_marking"):
+        raise_if_invalid_net(cpn, marking)
         self.cpn = cpn
         self.context = context or EvaluationContext()
         self.session_key = session_key
@@ -58,11 +122,138 @@ class CPNStreamlitVisualizer:
         self._has_timed_places = any(
             place.colorset.timed for place in self.cpn.places
         )
+        self._monitors: list[MonitorSpec] = []
+
+    def register_monitor(
+        self,
+        name: str,
+        predicate: Callable,
+        *,
+        before: bool = True,
+        default_enabled: bool = True,
+        transition_name: str | None = None,
+    ) -> None:
+        if not callable(predicate):
+            raise TypeError("predicate must be callable")
+        if any(m.name == name for m in self._monitors):
+            raise ValueError(f"Monitor {name!r} already registered")
+        slug = slugify_monitor_name(name)
+        self._monitors.append(MonitorSpec(
+            name=name,
+            slug=slug,
+            predicate=predicate,
+            before=before,
+            transition_name=transition_name,
+            default_enabled=default_enabled,
+        ))
+        cfg_key = self._monitor_cfg_key(slug)
+        if cfg_key not in st.session_state:
+            st.session_state[cfg_key] = default_enabled
+
+    def _monitor_cfg_key(self, slug: str) -> str:
+        return self._k(f"monitor_cfg_{slug}")
+
+    def _monitor_widget_key(self, slug: str) -> str:
+        return self._k(f"monitor_enabled_{slug}")
+
+    def _monitor_cfg_enabled(self, monitor: MonitorSpec) -> bool:
+        return bool(
+            st.session_state.get(
+                self._monitor_cfg_key(monitor.slug),
+                monitor.default_enabled,
+            )
+        )
+
+    def _sync_monitor_cfg_from_widgets(self) -> None:
+        """Copy widget keys to cfg keys before drivers may flush-rerun without sidebar."""
+        for m in self._monitors:
+            widget_key = self._monitor_widget_key(m.slug)
+            if widget_key in st.session_state:
+                st.session_state[self._monitor_cfg_key(m.slug)] = (
+                    st.session_state[widget_key]
+                )
+
+    def _on_monitor_enabled_change(self, slug: str) -> None:
+        widget_key = self._monitor_widget_key(slug)
+        cfg_key = self._monitor_cfg_key(slug)
+        enabled = bool(st.session_state.get(widget_key, True))
+        st.session_state[cfg_key] = enabled
+        if enabled:
+            return
+        triggered = list(st.session_state.get(self._k("monitors_triggered"), []))
+        for m in self._monitors:
+            if m.slug != slug:
+                continue
+            if m.name in triggered:
+                triggered = [name for name in triggered if name != m.name]
+            break
+        if triggered:
+            st.session_state[self._k("monitors_triggered")] = triggered
+        else:
+            st.session_state.pop(self._k("monitors_triggered"), None)
+        self._clear_status_slot("monitor_pause")
+
+    def _monitor_enabled_slugs(self) -> frozenset[str]:
+        enabled: set[str] = set()
+        for m in self._monitors:
+            if self._monitor_cfg_enabled(m):
+                enabled.add(m.slug)
+        return frozenset(enabled)
+
+    def _notify_monitor_hit(self, names: list[str]) -> None:
+        self._notify(
+            f"Monitors triggered: {', '.join(names)}",
+            level="success",
+            dedup_id="monitor_pause",
+        )
+
+    def _render_monitors_panel(self, batch_running: bool) -> None:
+        if not self._monitors:
+            return
+        triggered = set(st.session_state.get(self._k("monitors_triggered"), []))
+        with st.container(border=True):
+            st.markdown("**Monitors**")
+            if triggered:
+                st.caption(
+                    "Paused — use Fire or Start batch to continue "
+                    "(monitors stay enabled)."
+                )
+            for m in self._monitors:
+                widget_key = self._monitor_widget_key(m.slug)
+                if widget_key not in st.session_state:
+                    st.session_state[widget_key] = self._monitor_cfg_enabled(m)
+                phase = "Before" if m.before else "After"
+                label = f"{m.name} ({phase})"
+                if m.transition_name:
+                    label += f" · {m.transition_name}"
+                if m.name in triggered:
+                    label += " — triggered"
+                col_label, col_toggle = st.columns([4, 2])
+                with col_label:
+                    prefix = "▶ " if m.name in triggered else ""
+                    st.markdown(f"{prefix}**{label}**")
+                with col_toggle:
+                    st.toggle(
+                        "On",
+                        key=widget_key,
+                        disabled=batch_running,
+                        on_change=self._on_monitor_enabled_change,
+                        args=(m.slug,),
+                    )
+                st.session_state[self._monitor_cfg_key(m.slug)] = (
+                    st.session_state[widget_key]
+                )
 
     def _k(self, suffix: str) -> str:
         return f"{self.session_key}_{suffix}"
 
-    _STATUS_LEVEL_ORDER = ("error", "warning", "success", "info")
+    def _record_sim_error(self, exc: BaseException) -> None:
+        st.session_state[self._k("sim_error")] = format_simulation_error(exc)
+        st.session_state[self._k("sim_error_trace")] = traceback.format_exc()
+
+    def _clear_sim_error(self) -> None:
+        st.session_state.pop(self._k("sim_error"), None)
+        st.session_state.pop(self._k("sim_error_trace"), None)
 
     def _notify(
         self,
@@ -71,7 +262,7 @@ class CPNStreamlitVisualizer:
         level: str = "info",
         dedup_id: str | None = None,
     ) -> None:
-        """Persist a status line for the sidebar (survives reruns until cleared)."""
+        """Persist a status line for the main status banner (survives reruns until cleared)."""
         store = st.session_state.setdefault(self._k("status_messages"), {})
         key = dedup_id or f"_{len(store)}"
         entry = {"message": message, "level": level}
@@ -83,13 +274,31 @@ class CPNStreamlitVisualizer:
         store = st.session_state.get(self._k("status_messages"))
         if store:
             store.pop(dedup_id, None)
+        dismissed = st.session_state.get(self._k("status_dismissed"))
+        if dismissed is not None:
+            st.session_state[self._k("status_dismissed")] = clear_status_dismiss(
+                dedup_id, dismissed,
+            )
 
     def _clear_notifications(self) -> None:
         st.session_state.pop(self._k("status_messages"), None)
+        st.session_state.pop(self._k("status_dismissed"), None)
         prefix = self._k("toast_")
         for key in list(st.session_state.keys()):
             if isinstance(key, str) and key.startswith(prefix):
                 st.session_state.pop(key, None)
+
+    def _dismiss_status(self, dedup_id: str) -> None:
+        store = st.session_state.get(self._k("status_messages"), {})
+        entry = store.get(dedup_id)
+        if not entry:
+            return
+        dismissed = st.session_state.setdefault(self._k("status_dismissed"), {})
+        st.session_state[self._k("status_dismissed")] = apply_status_dismiss(
+            dedup_id,
+            entry["message"],
+            dismissed,
+        )
 
     def _sync_derived_status_messages(self, *, batch_running: bool) -> None:
         """Refresh slots driven by session flags (not set inline in panels)."""
@@ -100,12 +309,20 @@ class CPNStreamlitVisualizer:
         error = st.session_state.get(self._k("sim_error"))
         if error:
             self._notify(
-                f"Simulation error: {error}",
+                f"Simulation error — {error}",
                 level="error",
                 dedup_id="sim_error",
             )
+            trace = st.session_state.get(self._k("sim_error_trace"))
+            if trace:
+                self._notify(
+                    trace,
+                    level="error",
+                    dedup_id="sim_error_trace",
+                )
         else:
             self._clear_status_slot("sim_error")
+            self._clear_status_slot("sim_error_trace")
 
         if (
             not batch_running
@@ -134,22 +351,43 @@ class CPNStreamlitVisualizer:
         store = st.session_state.get(self._k("status_messages"))
         if not store:
             return
-        st.markdown("**Status**")
-        by_level = {level: [] for level in self._STATUS_LEVEL_ORDER}
-        for item in store.values():
+        dismissed = st.session_state.get(self._k("status_dismissed"), {})
+        level_rank = {
+            level: index for index, level in enumerate(self._STATUS_LEVEL_ORDER)
+        }
+        visible: list[tuple[str, str, str]] = []
+        for dedup_id, item in store.items():
+            message = item["message"]
+            if is_status_dismissed(dedup_id, message, dismissed):
+                continue
             level = item.get("level", "info")
-            if level not in by_level:
+            if level not in self._STATUS_WIDGETS:
                 level = "info"
-            by_level[level].append(item["message"])
-        for level in self._STATUS_LEVEL_ORDER:
-            widget = {
-                "error": st.error,
-                "warning": st.warning,
-                "success": st.success,
-                "info": st.info,
-            }.get(level, st.info)
-            for message in by_level.get(level, []):
-                widget(message)
+            visible.append((dedup_id, level, message))
+        if not visible:
+            return
+        visible.sort(
+            key=lambda row: (level_rank.get(row[1], len(level_rank)), row[0]),
+        )
+        with st.container(border=True):
+            st.markdown("**Status**")
+            for dedup_id, level, message in visible:
+                col_msg, col_btn = st.columns([12, 1], vertical_alignment="center")
+                with col_msg:
+                    if level == "error" and message.startswith("Traceback"):
+                        with st.expander("Error details", expanded=False):
+                            st.code(message, language="text")
+                    else:
+                        widget = self._STATUS_WIDGETS.get(level, st.info)
+                        widget(message)
+                with col_btn:
+                    st.button(
+                        "×",
+                        key=self._k(f"status_dismiss_{dedup_id}"),
+                        on_click=self._dismiss_status,
+                        args=(dedup_id,),
+                        help="Dismiss this message",
+                    )
 
     def _init_session_defaults(self):
         if self._k("step_count") not in st.session_state:
@@ -168,6 +406,10 @@ class CPNStreamlitVisualizer:
             st.session_state[self._k("batch_ui_mode")] = "steps"
         if self._k("sidebar_panel") not in st.session_state:
             st.session_state[self._k("sidebar_panel")] = "manual"
+        if self._k("graph_layout_strategy") not in st.session_state:
+            st.session_state[self._k("graph_layout_strategy")] = DEFAULT_LAYOUT_STRATEGY
+        if self._k("graph_layout_spacing_pct") not in st.session_state:
+            st.session_state[self._k("graph_layout_spacing_pct")] = DEFAULT_SPACING_PCT
 
     def _active_sidebar_panel(self, batch_running: bool) -> str:
         if batch_running:
@@ -273,14 +515,16 @@ class CPNStreamlitVisualizer:
                 "Stop batch",
                 key=control_key,
                 on_click=self._request_batch_stop,
-                disabled=not animated,
                 use_container_width=True,
                 type="primary",
                 help=(
                     "Halts after the current firing animation completes "
                     "(checked about every 50 ms)."
                     if animated
-                    else "Fast batch cannot be stopped mid-run. Wait for completion or refresh."
+                    else (
+                        f"Halts after the current batch chunk "
+                        f"(up to {FAST_BATCH_ADVANCES_PER_RUN} steps)."
+                    )
                 ),
             )
             return
@@ -334,13 +578,18 @@ class CPNStreamlitVisualizer:
         avail = sum(1 for t in ms.tokens if t.timestamp <= now)
         future = sum(1 for t in ms.tokens if t.timestamp > now)
         is_timed = place.colorset.timed
+        width, height = estimate_place_ellipse_size(place.name)
         return {
             "id": place.name,
-            "label": f"<b>{place.name}</b>",
+            "label": format_place_graph_label(place.name),
             "type": "place",
-            "shape": "circle",
-            "size": 35,
-            "font": {"multi": "html", "size": 14},
+            "shape": "ellipse",
+            "width": width,
+            "height": height,
+            "place_half_w": width // 2,
+            "place_half_h": height // 2,
+            "scaling": {"label": {"enabled": False}},
+            "font": {"multi": "html", "size": PLACE_LABEL_FONT_SIZE_PX},
             "color": {
                 "background": "#dce3ff",
                 "border": "#5d78ff",
@@ -359,16 +608,40 @@ class CPNStreamlitVisualizer:
         }
 
     def _transition_node(
-        self, trans, enabled_names: list[str], animating_transition: str | None,
+        self,
+        trans,
+        enabled_names: list[str],
+        animating_transition: str | None,
+        guard_error_names: list[str] | None = None,
     ) -> dict:
+        guard_error_names = guard_error_names or []
+        guard_error = trans.name in guard_error_names
         enabled = (
             trans.name in enabled_names
             or trans.name == animating_transition
         )
         has_action = trans.action is not None
-        label = f"<b>{trans.name}</b>\n" + ("<code>action</code>" if has_action else " ")
+        label = format_transition_graph_label(trans.name, has_action=has_action)
         delay = getattr(trans, "transition_delay", 0)
         guard = trans.guard_expr or ""
+        if guard_error:
+            trans_color = {
+                "background": "#f8d7da",
+                "border": "#dc3545",
+                "highlight": {"background": "#f1aeb5", "border": "#b02a37"},
+            }
+        elif enabled:
+            trans_color = {
+                "background": "#c8f7c5",
+                "border": "#2ecc71",
+                "highlight": {"background": "#a8e7a5", "border": "#27ae60"},
+            }
+        else:
+            trans_color = {
+                "background": "#f8f9fa",
+                "border": "#adb5bd",
+                "highlight": {"background": "#e9ecef", "border": "#6c757d"},
+            }
         return {
             "id": trans.name,
             "label": label,
@@ -376,15 +649,8 @@ class CPNStreamlitVisualizer:
             "shape": "box",
             "size": 25,
             "font": {"multi": "html", "size": 14},
-            "color": {
-                "background": "#c8f7c5" if enabled else "#f8f9fa",
-                "border": "#2ecc71" if enabled else "#adb5bd",
-                "highlight": {
-                    "background": "#a8e7a5" if enabled else "#e9ecef",
-                    "border": "#27ae60" if enabled else "#6c757d",
-                },
-            },
-            "external_top": guard,
+            "color": trans_color,
+            "external_top": format_guard_external_label(guard),
             "external_bottom": f"@+ {delay}" if delay > 0 else "",
             "external_bl": str(trans.priority),
             "guard": guard,
@@ -396,11 +662,12 @@ class CPNStreamlitVisualizer:
         }
 
     @staticmethod
-    def _arc_edge(arc, connections: set[tuple[str, str]]) -> dict:
+    def _arc_edge(arc, connections: set[tuple[str, str]], arc_index: int) -> dict:
         src, tgt = arc.source.name, arc.target.name
         is_bi = (tgt, src) in connections
+        pair_key = f"{src}|{tgt}"
         return {
-            "id": f"{src}|{tgt}",
+            "id": arc_edge_id(src, tgt, arc_index),
             "from": src,
             "to": tgt,
             "label": str(arc.expression),
@@ -409,27 +676,119 @@ class CPNStreamlitVisualizer:
             "color": {"color": "#999999", "inherit": False},
             "smooth": {"enabled": True, "type": "curvedCW", "roundness": 0.2} if is_bi else False,
             "is_curved": is_bi,
+            "arc_key": pair_key,
         }
+
+    def _graph_node_ids(self) -> list[str]:
+        return [p.name for p in self.cpn.places] + [t.name for t in self.cpn.transitions]
+
+    def _graph_layout_fingerprint(self) -> str:
+        return graph_layout_storage_key(self._graph_node_ids())
+
+    def _clear_graph_layout_session(self) -> None:
+        st.session_state.pop(self._k("graph_layout_positions"), None)
+        st.session_state.pop(self._k("graph_layout_view"), None)
+        st.session_state.pop(self._k("graph_layout_storage_key"), None)
+        st.session_state.pop(self._k("layout_import_digest"), None)
+
+    def _get_saved_layout_for_payload(self) -> dict | None:
+        if st.session_state.get(self._k("graph_layout_storage_key")) != self._graph_layout_fingerprint():
+            return None
+        positions = st.session_state.get(self._k("graph_layout_positions"))
+        if not positions:
+            return None
+        saved: dict = {"positions": positions}
+        view = st.session_state.get(self._k("graph_layout_view"))
+        if view:
+            saved["view"] = view
+        return saved
+
+    def _set_saved_layout_session(
+        self, positions: dict, view: dict | None = None,
+    ) -> None:
+        st.session_state[self._k("graph_layout_storage_key")] = self._graph_layout_fingerprint()
+        st.session_state[self._k("graph_layout_positions")] = positions
+        if view is not None:
+            st.session_state[self._k("graph_layout_view")] = view
+
+    @staticmethod
+    def _parse_graph_component_value(
+        raw: str | None,
+    ) -> tuple[str | None, dict | None]:
+        if not raw:
+            return None, None
+        if raw.startswith("{"):
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                return None, None
+            if isinstance(data, dict) and data.get("type") == "layout":
+                return None, data
+        return raw, None
+
+    def _handle_graph_layout_sync(self, layout: dict) -> None:
+        positions = layout.get("positions")
+        if not positions:
+            return
+        self._set_saved_layout_session(positions, layout.get("view"))
+
+    def _layout_export_json(self) -> str:
+        positions = {}
+        if st.session_state.get(self._k("graph_layout_storage_key")) == self._graph_layout_fingerprint():
+            positions = st.session_state.get(self._k("graph_layout_positions")) or {}
+        return json.dumps(build_layout_file_payload(positions), indent=2)
+
+    def _try_import_layout_file(self, uploaded) -> None:
+        if uploaded is None:
+            return
+        if isinstance(uploaded, list):
+            uploaded = uploaded[0] if uploaded else None
+        if uploaded is None:
+            return
+        digest = f"{uploaded.name}:{uploaded.size}"
+        if st.session_state.get(self._k("layout_import_digest")) == digest:
+            return
+        try:
+            imported = parse_layout_file_json(uploaded.getvalue().decode("utf-8"))
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        node_ids = self._graph_node_ids()
+        existing = st.session_state.get(self._k("graph_layout_positions"))
+        if st.session_state.get(self._k("graph_layout_storage_key")) != self._graph_layout_fingerprint():
+            existing = None
+        merged = apply_imported_positions(node_ids, existing, imported)
+        self._set_saved_layout_session(merged)
+        st.session_state[self._k("prefer_saved_layout")] = True
+        st.session_state[self._k("layout_import_digest")] = digest
+        applied = sum(1 for nid in node_ids if nid in imported)
+        st.success(f"Imported positions for {applied} node(s).")
 
     def _prepare_data(self, enabled_names: list[str],
                       animate_in: list[dict] | None = None,
                       animate_out: list[dict] | None = None,
                       animation_timings: dict[str, int] | None = None,
-                      animating_transition: str | None = None):
-        animate_in = animate_in or []
-        animate_out = animate_out or []
+                      animating_transition: str | None = None,
+                      guard_error_names: list[str] | None = None):
+        animate_in = normalize_animation_arcs(animate_in or [])
+        animate_out = normalize_animation_arcs(animate_out or [])
         now = self.marking.global_clock
         nodes = [
             self._place_node(place, now)
             for place in self.cpn.places
         ]
         nodes.extend(
-            self._transition_node(trans, enabled_names, animating_transition)
+            self._transition_node(
+                trans, enabled_names, animating_transition, guard_error_names,
+            )
             for trans in self.cpn.transitions
         )
 
         connections = {(a.source.name, a.target.name) for a in self.cpn.arcs}
-        edges = [self._arc_edge(arc, connections) for arc in self.cpn.arcs]
+        edges = [
+            self._arc_edge(arc, connections, arc_index)
+            for arc_index, arc in enumerate(self.cpn.arcs)
+        ]
 
         timings = dict(
             animation_timings or compute_animation_timings(self._effective_anim_ms())
@@ -438,44 +797,115 @@ class CPNStreamlitVisualizer:
             timings["total_duration_ms"] = animation_wait_ms(
                 {"in": animate_in, "out": animate_out}, timings,
             )
-        return {
+        node_count = len(nodes)
+        edge_count = len(edges)
+        layout = compute_graph_layout(
+            node_count,
+            edge_count,
+            strategy=st.session_state.get(
+                self._k("graph_layout_strategy"), DEFAULT_LAYOUT_STRATEGY,
+            ),
+            spacing_pct=st.session_state.get(
+                self._k("graph_layout_spacing_pct"), DEFAULT_SPACING_PCT,
+            ),
+        )
+        if layout.get("large"):
+            for node in nodes:
+                if node.get("type") == "transition":
+                    node["external_top"] = format_guard_external_label(
+                        node.get("guard") or "",
+                        max_len=GUARD_EXTERNAL_MAX_LEN_LARGE,
+                    )
+        payload = {
             "nodes": nodes,
             "edges": edges,
             "animate_in": animate_in,
             "animate_out": animate_out,
             "animation": timings,
             "enabled_names": enabled_names,
+            "guard_error_names": guard_error_names or [],
             "animating_transition": animating_transition,
+            "layout": layout,
             "sync_graph_select": (
                 self._active_sidebar_panel(self._batch_running()) == "manual"
                 and bool(enabled_names)
             ),
         }
+        if st.session_state.pop(self._k("clear_graph_layout"), False):
+            payload["clear_saved_layout"] = True
+            self._clear_graph_layout_session()
+        else:
+            saved_layout = self._get_saved_layout_for_payload()
+            if saved_layout:
+                payload["saved_layout"] = saved_layout
+            if st.session_state.pop(self._k("prefer_saved_layout"), False):
+                payload["prefer_saved_layout"] = True
+        if st.session_state.pop(self._k("fit_graph_in_view"), False):
+            payload["fit_in_view"] = True
+            payload["fit_in_view_token"] = st.session_state.get(
+                self._k("fit_in_view_token"), 0,
+            )
+        return payload
 
     def fire(self, transition_name: str) -> dict:
         """Fire a transition; increment step_count on success."""
-        st.session_state[self._k("sim_error")] = None
+        self._clear_sim_error()
         try:
             trans = self.cpn.get_transition_by_name(transition_name)
+            if trans is None:
+                raise ValueError(f"Unknown transition {transition_name!r}.")
+            all_enabled = get_enabled_transitions(
+                self.cpn, self.marking, self.context, only_best_priority=False,
+            )
+            enabled_names = enabled_transition_names(all_enabled)
+            enabled_slugs = self._monitor_enabled_slugs()
+            skip_monitors = st.session_state.pop(self._k("monitors_resume_once"), False)
+            before_hit = [] if skip_monitors else evaluate_monitors(
+                self._monitors,
+                phase="before",
+                cpn=self.cpn,
+                marking=self.marking,
+                pending_transition=transition_name,
+                enabled_names=enabled_names,
+                enabled_slugs=enabled_slugs,
+            )
+            if before_hit:
+                st.session_state[self._k("monitors_triggered")] = before_hit
+                self._notify_monitor_hit(before_hit)
+                return {"monitor_hit": True, "monitors": before_hit, "in": [], "out": []}
             info = self.cpn.fire_transition(trans, self.marking, self.context)
             info["transition"] = transition_name
             st.session_state[self._k("step_count")] = st.session_state.get(self._k("step_count"), 0) + 1
             st.session_state[self._k("last_fired_name")] = transition_name
             st.session_state.pop(self._k("manual_deadlock"), None)
+            after_hit = [] if skip_monitors else evaluate_monitors(
+                self._monitors,
+                phase="after",
+                cpn=self.cpn,
+                marking=self.marking,
+                pending_transition=transition_name,
+                enabled_names=enabled_names,
+                enabled_slugs=enabled_slugs,
+            )
+            if after_hit:
+                st.session_state[self._k("monitors_triggered")] = after_hit
+                self._notify_monitor_hit(after_hit)
+                info["monitor_hit"] = True
+                info["monitors"] = after_hit
             return info
         except Exception as e:
-            st.session_state[self._k("sim_error")] = str(e)
+            self._record_sim_error(e)
             return {"in": [], "out": []}
 
     def _advance_global_clock_once(self) -> bool:
         """Advance global clock once. Returns True if the clock moved."""
-        st.session_state[self._k("sim_error")] = None
+        self._clear_sim_error()
         try:
             before = self.marking.global_clock
             self.cpn.advance_global_clock(self.marking)
             return self.marking.global_clock != before
         except Exception as e:
-            st.session_state[self._k("sim_error")] = str(e)
+            self._record_sim_error(e)
             return False
 
     def _coalesce_manual_time_advance(
@@ -523,6 +953,14 @@ class CPNStreamlitVisualizer:
             info = self.fire(enabled_name)
             if st.session_state.get(self._k("sim_error")):
                 return "error", {}
+            if info.get("monitor_hit"):
+                if info.get("transition"):
+                    st.session_state[self._k("batch_firings")] = (
+                        st.session_state.get(self._k("batch_firings"), 0) + 1
+                    )
+                if info.get("transition") and st.session_state.get(self._k("batch_animate")):
+                    return "fired", info
+                return "monitor", info
             st.session_state[self._k("batch_firings")] = st.session_state.get(self._k("batch_firings"), 0) + 1
             return "fired", info
 
@@ -537,8 +975,8 @@ class CPNStreamlitVisualizer:
         if result == "stopped":
             return "Stopped"
         if result == "error":
-            err = st.session_state.get(self._k("sim_error"), "unknown")
-            return f"Error: {err}"
+            err = st.session_state.get(self._k("sim_error"), "unknown error")
+            return f"Error — {err}"
         if result == "deadlock":
             return f"Deadlock at time {self.marking.global_clock}"
         if result == "idle":
@@ -550,6 +988,17 @@ class CPNStreamlitVisualizer:
             n = st.session_state.get(self._k("batch_firings"), 0)
             return f"Finished ({n} transitions)"
         return "Finished"
+
+    def _request_fit_graph_in_view(self) -> None:
+        """Set flag consumed by _prepare_data on the same run (graph renders after sidebar)."""
+        st.session_state[self._k("fit_graph_in_view")] = True
+        st.session_state[self._k("fit_in_view_token")] = (
+            int(st.session_state.get(self._k("fit_in_view_token"), 0)) + 1
+        )
+
+    def _request_clear_graph_layout(self) -> None:
+        """Set flag consumed by _prepare_data on the same run (graph renders after sidebar)."""
+        st.session_state[self._k("clear_graph_layout")] = True
 
     def _request_rerun(self) -> None:
         """Schedule a rerun; always pair with _flush_rerun before drawing widgets."""
@@ -580,25 +1029,13 @@ class CPNStreamlitVisualizer:
 
     def _render_simulation_metrics(self, step_count: int, n_enabled: int) -> None:
         """Prominent global clock, firing count, and enabled transitions (core CPN state)."""
-        clock_col, steps_col, enabled_col = st.columns(3)
-        with clock_col:
-            st.metric(
-                "Clock",
+        st.text(
+            format_simulation_metrics_row(
                 self.marking.global_clock,
-                help="Global simulation time (@). Advances when timed tokens become ready or auto-advance runs.",
-            )
-        with steps_col:
-            st.metric(
-                "Firings",
                 step_count,
-                help="Successful transition firings since the last reset.",
-            )
-        with enabled_col:
-            st.metric(
-                "Enabled",
                 n_enabled,
-                help="Transitions that can fire at the current clock.",
             )
+        )
 
     def _render_batch_running_summary(self) -> None:
         mode_key = st.session_state.get(self._k("batch_mode"), "steps")
@@ -799,7 +1236,7 @@ class CPNStreamlitVisualizer:
         self.marking = st.session_state[self.session_key]
         st.session_state[self._k("step_count")] = 0
         st.session_state[self._k("anim_ms")] = DEFAULT_TRANSITION_ANIMATION_MS
-        st.session_state.pop(self._k("sim_error"), None)
+        self._clear_sim_error()
         st.session_state.pop(self._k("last_fired"), None)
         st.session_state.pop(self._k("last_fired_name"), None)
         st.session_state.pop(self._k("manual_auto_advance"), None)
@@ -814,11 +1251,25 @@ class CPNStreamlitVisualizer:
         st.session_state.pop(self._k("show_frame_painted"), None)
         st.session_state.pop(self._k("run_drivers_after_sidebar"), None)
         st.session_state.pop(self._k("graph_pick_pending"), None)
+        st.session_state.pop(self._k("monitors_triggered"), None)
+        st.session_state.pop(self._k("monitors_resume_once"), None)
+        for m in self._monitors:
+            st.session_state.pop(self._monitor_widget_key(m.slug), None)
+            st.session_state[self._monitor_cfg_key(m.slug)] = m.default_enabled
         st.session_state[self._k("sidebar_panel")] = "manual"
         self._clear_notifications()
 
+    def _arm_monitor_resume_once(self) -> None:
+        """Skip monitor checks on the next fire only when resuming from a pause."""
+        if not st.session_state.get(self._k("monitors_triggered")):
+            return
+        st.session_state[self._k("monitors_resume_once")] = True
+        st.session_state.pop(self._k("monitors_triggered"), None)
+        self._clear_status_slot("monitor_pause")
+
     def _fire_selected_transition(self) -> None:
         """Run before sidebar widgets on Fire click (on_click), like Stop batch."""
+        self._arm_monitor_resume_once()
         name = st.session_state.get(self._k("select"))
         if not name:
             return
@@ -900,9 +1351,8 @@ class CPNStreamlitVisualizer:
     def _start_batch(self, mode: str, max_steps: int, target_time: int,
                      animate: bool, auto_advance: bool, anim_ms: int):
         st.session_state.pop(self._k("last_fired"), None)
-        st.session_state.pop(self._k("sim_error"), None)
+        self._clear_sim_error()
         self._clear_status_slot("batch_status")
-        self._clear_status_slot("batch_validation")
         st.session_state.pop(self._k("show_sleep_complete"), None)
         st.session_state.pop(self._k("show_frame_painted"), None)
         st.session_state[self._k("batch_mode")] = mode
@@ -915,15 +1365,26 @@ class CPNStreamlitVisualizer:
         st.session_state[self._k("batch_firings")] = 0
         st.session_state[self._k("batch_fast_iterations")] = 0
         st.session_state[self._k("batch_stop_requested")] = False
+        self._arm_monitor_resume_once()
         st.session_state[self._k("batch_running")] = True
         st.session_state[self._k("batch_status")] = "Running"
         st.session_state[self._k("sidebar_panel")] = "batch"
 
         if animate:
             st.session_state[self._k("batch_phase")] = "advance"
+            st.session_state[self._k("run_drivers_after_sidebar")] = True
         else:
             st.session_state[self._k("batch_phase")] = "fast"
-        st.session_state[self._k("run_drivers_after_sidebar")] = True
+
+    def _run_fast_batch_after_sidebar(self) -> None:
+        """Run fast batch after sidebar so Stop batch stays reachable between chunks."""
+        if not self._batch_running():
+            return
+        if st.session_state.get(self._k("batch_animate")):
+            return
+        if self._abort_batch_if_stop_requested():
+            return
+        self._run_fast_batch_phase()
 
     def _clear_opposite_batch_widgets(self, mode_key: str) -> None:
         if mode_key == "steps":
@@ -947,6 +1408,7 @@ class CPNStreamlitVisualizer:
         require_animate: bool,
         on_fired: Callable[[dict], None] | None = None,
         track_iterations: bool = False,
+        max_per_run: int | None = None,
     ) -> None:
         if not self._batch_running():
             return
@@ -964,8 +1426,9 @@ class CPNStreamlitVisualizer:
             if track_iterations else 0
         )
 
-        for _ in range(MAX_ADVANCES_PER_RUN):
-            if require_animate and st.session_state.get(self._k("batch_stop_requested")):
+        chunk = max_per_run if max_per_run is not None else MAX_ADVANCES_PER_RUN
+        for _ in range(chunk):
+            if st.session_state.get(self._k("batch_stop_requested")):
                 self._end_batch("Stopped", rerun=True)
                 return
             if track_iterations and iterations >= FAST_BATCH_MAX_ITERATIONS:
@@ -976,6 +1439,13 @@ class CPNStreamlitVisualizer:
 
             if track_iterations:
                 iterations += 1
+
+            if result == "monitor":
+                self._end_batch(
+                    monitor_batch_status_message(info.get("monitors", [])),
+                    rerun=True,
+                )
+                return
 
             if result == "fired" and on_fired is not None:
                 on_fired(info)
@@ -995,6 +1465,7 @@ class CPNStreamlitVisualizer:
             expected_phase="fast",
             require_animate=False,
             track_iterations=True,
+            max_per_run=FAST_BATCH_ADVANCES_PER_RUN,
         )
 
     def _run_animated_advance_phase(self) -> None:
@@ -1016,6 +1487,14 @@ class CPNStreamlitVisualizer:
             return
 
         st.session_state.pop(self._k("show_sleep_complete"), None)
+
+        last_fired = st.session_state.get(self._k("last_fired"), {})
+        if last_fired.get("monitor_hit"):
+            self._end_batch(
+                monitor_batch_status_message(last_fired.get("monitors", [])),
+                rerun=True,
+            )
+            return
 
         if st.session_state.get(self._k("batch_stop_requested")):
             self._end_batch("Stopped", rerun=True)
@@ -1044,14 +1523,17 @@ class CPNStreamlitVisualizer:
             transitions_enabled=transitions_enabled,
         )
         for step in (
-            self._run_fast_batch_phase,
             self._run_animated_advance_phase,
             self._run_show_continuation_pre_sidebar,
         ):
             step()
 
     def _render_graph_panel(
-        self, height: int, enabled_names: list[str], last_fired: dict,
+        self,
+        height: int,
+        enabled_names: list[str],
+        last_fired: dict,
+        guard_error_names: list[str] | None = None,
     ) -> None:
         timings = compute_animation_timings(self._effective_anim_ms())
         self._last_animation_timings = timings
@@ -1064,16 +1546,79 @@ class CPNStreamlitVisualizer:
             last_fired.get("out", []),
             animation_timings=timings,
             animating_transition=animating_transition,
+            guard_error_names=guard_error_names,
         )
         frame_height = height + 20
-        picked = cpn_graph(data, height=frame_height, key=self._k("graph"))
-        self._handle_graph_component_pick(picked, enabled_names)
+        raw = cpn_graph(data, height=frame_height, key=self._k("graph"))
+        pick, layout = self._parse_graph_component_value(raw)
+        if layout:
+            self._handle_graph_layout_sync(layout)
+        self._handle_graph_component_pick(pick, enabled_names)
 
     def _show_animation_paint_pass(self) -> bool:
         """First show-phase run: mount graph iframe only, then rerun before sidebar."""
         return (
             self._needs_show_animation_wait()
             and not st.session_state.get(self._k("show_frame_painted"))
+        )
+
+    def _inject_sidebar_compact_css(self) -> None:
+        """Tighter sidebar typography and spacing to reduce scrolling."""
+        st.markdown(
+            """
+<style>
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+    padding-top: 0.65rem;
+    padding-bottom: 0.65rem;
+}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {
+    gap: 0.3rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+    gap: 0.3rem !important;
+    align-items: center !important;
+}
+[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"] {
+    padding: 0.4rem 0.5rem !important;
+}
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p,
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] span {
+    font-size: 0.78rem !important;
+    line-height: 1.25 !important;
+}
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] .stMarkdown li,
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"],
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+    font-size: 0.76rem !important;
+    line-height: 1.25 !important;
+    margin-bottom: 0.1rem !important;
+}
+[data-testid="stSidebar"] button {
+    min-height: 1.55rem !important;
+    height: auto !important;
+    font-size: 0.76rem !important;
+    padding: 0.12rem 0.4rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stSlider"] {
+    padding-top: 0.1rem !important;
+    padding-bottom: 0.35rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stExpander"] details summary {
+    font-size: 0.78rem !important;
+    padding-top: 0.2rem !important;
+    padding-bottom: 0.2rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stFileUploader"] {
+    font-size: 0.76rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stFileUploader"] section {
+    padding: 0.35rem !important;
+}
+</style>
+            """,
+            unsafe_allow_html=True,
         )
 
     def render(self, height: int = 800):
@@ -1085,17 +1630,21 @@ class CPNStreamlitVisualizer:
         3. Sidebar (skipped on animation paint pass — graph iframe only)
         4. Graph; optional animation wait then flush (sidebar not redrawn on that run)
         """
+        self._inject_sidebar_compact_css()
         self._repair_batch_session()
         self._sync_batch_mode_ui()
+        self._sync_monitor_cfg_from_widgets()
         self._flush_rerun()
 
         enabled = get_enabled_transitions(self.cpn, self.marking, self.context)
         enabled_names = [t.name for t in enabled]
+        guard_error_names = list(self.context.guard_error_names)
         self._apply_graph_transition_pick(enabled_names)
 
         self._run_pre_sidebar_drivers(transitions_enabled=bool(enabled))
         self._flush_rerun()
 
+        guard_error_names = list(self.context.guard_error_names)
         self._refresh_deadlock_flags(enabled_names)
 
         batch_running = self._batch_running()
@@ -1127,6 +1676,7 @@ class CPNStreamlitVisualizer:
                     st.session_state[self._k("anim_ms")] = anim_ms_int
 
                 self._render_sidebar_panel_switch(batch_running)
+                self._render_monitors_panel(batch_running)
                 if panel == "batch":
                     self._render_batch_simulation_panel(
                         batch_running=batch_running,
@@ -1148,8 +1698,77 @@ class CPNStreamlitVisualizer:
                     help="Disabled while a batch is running.",
                 )
 
-                self._sync_derived_status_messages(batch_running=batch_running)
-                self._render_status_messages()
+                strategy_key = self._k("graph_layout_strategy")
+                current_strategy = st.session_state.get(
+                    strategy_key, DEFAULT_LAYOUT_STRATEGY,
+                )
+                if current_strategy in ("auto", "grid"):
+                    current_strategy = "force" if current_strategy == "auto" else "cluster"
+                strategy_index = (
+                    _LAYOUT_STRATEGY_LABELS.index(_LAYOUT_LABEL_BY_STRATEGY[current_strategy])
+                    if current_strategy in _LAYOUT_LABEL_BY_STRATEGY
+                    else 0
+                )
+                strategy_label = st.selectbox(
+                    "Layout strategy",
+                    _LAYOUT_STRATEGY_LABELS,
+                    index=strategy_index,
+                    disabled=batch_running,
+                    help="Force: physics. Flow LR: left-to-right flow inside each module; on large nets "
+                    "modules group by top-level name and pack by size (reset layout to apply). "
+                    "Cluster: group by dotted parent path, compact grid per submodule. "
+                    "Layered LR: left-to-right flow layers with crossing reduction; on large nets "
+                    "layers inside each top-level module, modules in one row (reset layout to apply).",
+                )
+                st.session_state[strategy_key] = _LAYOUT_STRATEGY_BY_LABEL[strategy_label]
+
+                st.slider(
+                    "Spacing %",
+                    min_value=MIN_SPACING_PCT,
+                    max_value=MAX_SPACING_PCT,
+                    step=5,
+                    key=self._k("graph_layout_spacing_pct"),
+                    disabled=batch_running,
+                    help="Node distance for the next Reset graph layout (50–500%).",
+                )
+
+                st.button(
+                    "Fit graph in view",
+                    key=self._k("fit_graph_in_view_btn"),
+                    on_click=self._request_fit_graph_in_view,
+                    disabled=batch_running,
+                    use_container_width=True,
+                    help="Pan/zoom the view only — node positions are unchanged.",
+                )
+
+                st.button(
+                    "Reset graph layout",
+                    key=self._k("reset_graph_layout"),
+                    on_click=self._request_clear_graph_layout,
+                    disabled=batch_running,
+                    use_container_width=True,
+                    help="Clear saved positions and apply the layout strategy and spacing above.",
+                )
+
+                st.download_button(
+                    "Export graph layout",
+                    data=self._layout_export_json(),
+                    file_name="graph-layout.json",
+                    mime="application/json",
+                    key=self._k("export_graph_layout"),
+                    disabled=batch_running,
+                    use_container_width=True,
+                    help="Download node positions (JSON: version + positions).",
+                )
+                uploaded_layout = st.file_uploader(
+                    "Import graph layout",
+                    type=["json"],
+                    accept_multiple_files=False,
+                    key=self._k("import_graph_layout"),
+                    disabled=batch_running,
+                    help="Apply positions for matching node ids; unknown ids are ignored.",
+                )
+                self._try_import_layout_file(uploaded_layout)
 
                 with st.expander("Tips", expanded=False):
                     st.markdown(
@@ -1160,19 +1779,34 @@ class CPNStreamlitVisualizer:
                         "- **Advance clock when idle** moves global time when nothing can fire "
                         "(Step and batch Steps).\n"
                         "- **Click** a place or transition on the graph for tokens, guard, "
-                        "and action details."
+                        "and action details.\n"
+                        "- **Layout strategy** and **Spacing %** apply on **Reset graph layout**.\n"
+                        "- **Fit graph in view** adjusts pan/zoom only (layout unchanged).\n"
+                        "- **Export / Import graph layout** saves or restores node positions (JSON).\n"
+                        "- **Monitors** pause simulation when their condition matches; "
+                        "use **Fire** or **Start batch** to continue without disabling them."
                     )
+
+        if not paint_pass:
+            self._run_fast_batch_after_sidebar()
+            self._flush_rerun()
 
         if st.session_state.pop(self._k("run_drivers_after_sidebar"), False):
             self._run_pre_sidebar_drivers()
             self._flush_rerun()
+
+        if not paint_pass:
+            self._sync_derived_status_messages(batch_running=batch_running)
+            self._render_status_messages()
 
         if self._needs_show_animation_wait():
             last_fired = st.session_state.get(self._k("last_fired"), {})
         else:
             last_fired = st.session_state.pop(self._k("last_fired"), {})
 
-        self._render_graph_panel(height, enabled_names, last_fired)
+        self._render_graph_panel(
+            height, enabled_names, last_fired, guard_error_names,
+        )
         self._flush_rerun()
         if self._run_show_animation_wait_after_graph(last_fired):
             self._flush_rerun()
